@@ -1,0 +1,17 @@
+{
+  "name": "nle-server",
+  "version": "0.1.0",
+  "description": "Client-side web-based NLE – Phase 1: WASM frame server with WebGL renderer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev":           "vite",
+    "build":         "vite build",
+    "build:wasm":    "bash scripts/build_wasm.sh",
+    "build:ffmpeg":  "bash scripts/build_ffmpeg.sh",
+    "preview":       "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
+  }
+}

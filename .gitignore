@@ -1,0 +1,9 @@
+node_modules/
+dist/
+build/
+build_wasm/
+deps/
+*.wasm
+*.o
+*.a
+.DS_Store
