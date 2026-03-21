@@ -1,0 +1,104 @@
+/* ── Reset & custom properties ───────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:         #0e0e0e;
+  --panel-bg:   #181818;
+  --panel-hdr:  #141414;
+  --border:     #2a2a2a;
+  --accent:     #4f8fff;
+  --accent-dim: #2a5abf;
+  --text:       #d4d4d4;
+  --muted:      #666;
+  --radius:     4px;
+
+  /* Layout split positions (updated by layout.js drag) */
+  --col-w:  50%;
+  --top-h:  55%;
+}
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+/* ── App shell — nested flex for resizable 4-panel layout ─────────────────── */
+#app {
+  display: flex;
+  flex-direction: column;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* Top row: Source Monitor | v-divider | Program Monitor */
+#top-row,
+#bottom-row {
+  display: flex;
+  flex-direction: row;
+  overflow: hidden;
+  min-height: 0;
+}
+
+#top-row {
+  height: var(--top-h);
+  flex-shrink: 0;
+}
+
+#bottom-row {
+  flex: 1;
+  min-height: 0;
+}
+
+/* ── Panels ────────────────────────────────────────────────────────────────── */
+.panel {
+  display: flex;
+  flex-direction: column;
+  background: var(--panel-bg);
+  overflow: hidden;
+  min-width: 0;
+}
+
+#source-monitor,
+#media-bin {
+  flex: 0 0 var(--col-w);
+  min-width: 200px;
+  border-right: 1px solid var(--border);
+}
+
+#program-monitor,
+#timeline-panel {
+  flex: 1;
+  min-width: 200px;
+}
+
+/* ── Dividers ──────────────────────────────────────────────────────────────── */
+.divider-v {
+  flex: 0 0 4px;
+  background: var(--border);
+  cursor: col-resize;
+  transition: background 0.1s;
+  position: relative;
+  z-index: 10;
+}
+.divider-v:hover,
+.divider-v.dragging { background: var(--accent); }
+
+.divider-h {
+  flex: 0 0 4px;
+  background: var(--border);
+  cursor: row-resize;
+  transition: background 0.1s;
+  position: relative;
+  z-index: 10;
+}
+.divider-h:hover,
+.divider-h.dragging { background: var(--accent); }

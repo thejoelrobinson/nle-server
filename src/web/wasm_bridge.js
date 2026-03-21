@@ -182,6 +182,19 @@ export class FrameServerBridge {
     if (wasPlaying) this.play();
   }
 
+  /**
+   * Decode and return the frame at `seconds` without firing onFrame callback.
+   * Used by FrameServerPool to decode a specific source clip frame for the
+   * Program Monitor's timeline playback.
+   * @param {number} seconds
+   * @returns {object|null} YUV frame object, or null on error
+   */
+  decodeFrameAt(seconds) {
+    if (!this._server) return null;
+    this._pts = Math.max(0, seconds);
+    return this._server.decode_frame_at(this._pts) || null;
+  }
+
   get isPlaying()  { return this._playing; }
   get currentPts() { return this._pts; }
   get duration()   { return this._duration; }
@@ -227,5 +240,71 @@ export class FrameServerBridge {
   destroy() {
     this.pause();
     if (this._server) { this._server.close(); this._server.delete(); this._server = null; }
+  }
+}
+
+// ── FrameServerPool ───────────────────────────────────────────────────────
+//
+// Maintains a cache of source_path → FrameServerBridge so the Program Monitor
+// can decode any clip frame without re-opening the file on every seek.
+//
+// Usage:
+//   const pool = new FrameServerPool();
+//   await pool.addFile(file);                    // adds by file.name as key
+//   const frame = pool.decodeFrameAt(path, sec); // null if path not loaded
+
+export class FrameServerPool {
+  constructor() {
+    this._bridges = new Map();  // source_path → FrameServerBridge
+  }
+
+  /**
+   * Open a File and add it to the pool, keyed by file.name.
+   * No-op if already loaded.
+   * @param {File} file
+   */
+  async addFile(file) {
+    if (this._bridges.has(file.name)) return;
+
+    const bridge = new FrameServerBridge({
+      onFrame:    () => {},
+      onEnd:      () => {},
+      onError:    () => {},
+      onMetadata: () => {},
+    });
+
+    await bridge.ready();
+    await bridge.openFile(file);
+    this._bridges.set(file.name, bridge);
+  }
+
+  /**
+   * Check if a source path is loaded.
+   * @param {string} sourcePath
+   * @returns {boolean}
+   */
+  has(sourcePath) {
+    return this._bridges.has(sourcePath);
+  }
+
+  /**
+   * Decode the frame at `seconds` from the given source.
+   * Returns the YUV frame object, or null if source is not loaded.
+   * @param {string} sourcePath
+   * @param {number} seconds
+   * @returns {object|null}
+   */
+  decodeFrameAt(sourcePath, seconds) {
+    const bridge = this._bridges.get(sourcePath);
+    if (!bridge) return null;
+    return bridge.decodeFrameAt(seconds);
+  }
+
+  /**
+   * Remove all bridges from the pool.
+   */
+  destroy() {
+    for (const bridge of this._bridges.values()) bridge.destroy();
+    this._bridges.clear();
   }
 }

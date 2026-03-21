@@ -3,220 +3,141 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>NLE Server – Frame Player</title>
-  <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-    :root {
-      --bg:       #0e0e0e;
-      --panel:    #1a1a1a;
-      --border:   #2e2e2e;
-      --accent:   #4f8fff;
-      --text:     #d4d4d4;
-      --muted:    #666;
-      --radius:   6px;
-    }
-
-    body {
-      background: var(--bg);
-      color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      font-size: 13px;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      min-height: 100vh;
-      padding: 24px 16px;
-      gap: 16px;
-    }
-
-    h1 {
-      font-size: 15px;
-      font-weight: 600;
-      letter-spacing: .04em;
-      color: #fff;
-    }
-
-    /* ── Drop zone / open button ─────────────────────────────── */
-    #drop-zone {
-      width: 100%;
-      max-width: 900px;
-      border: 2px dashed var(--border);
-      border-radius: var(--radius);
-      padding: 32px;
-      text-align: center;
-      cursor: pointer;
-      transition: border-color .15s, background .15s;
-    }
-    #drop-zone:hover, #drop-zone.drag-over {
-      border-color: var(--accent);
-      background: rgba(79,143,255,.05);
-    }
-    #drop-zone p { color: var(--muted); margin-bottom: 12px; }
-
-    button {
-      background: var(--accent);
-      color: #fff;
-      border: none;
-      border-radius: var(--radius);
-      padding: 7px 16px;
-      font-size: 13px;
-      cursor: pointer;
-      transition: opacity .15s;
-    }
-    button:hover { opacity: .85; }
-    button:disabled { opacity: .4; cursor: not-allowed; }
-
-    /* ── Canvas ─────────────────────────────────────────────── */
-    #canvas-wrap {
-      display: none;
-      width: 100%;
-      max-width: 900px;
-      background: #000;
-      border-radius: var(--radius);
-      overflow: hidden;
-      position: relative;
-    }
-    #canvas-wrap.visible { display: block; }
-    #gl-canvas {
-      display: block;
-      width: 100%;
-      height: auto;
-    }
-
-    /* Overlay shown while loading */
-    #loading-overlay {
-      display: none;
-      position: absolute;
-      inset: 0;
-      background: rgba(0,0,0,.7);
-      align-items: center;
-      justify-content: center;
-      font-size: 14px;
-      color: #fff;
-    }
-    #loading-overlay.visible { display: flex; }
-
-    /* ── Transport bar ──────────────────────────────────────── */
-    #transport {
-      display: none;
-      width: 100%;
-      max-width: 900px;
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 12px 16px;
-      gap: 12px;
-      flex-direction: column;
-    }
-    #transport.visible { display: flex; }
-
-    #scrub-row {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    #scrubber {
-      flex: 1;
-      accent-color: var(--accent);
-      cursor: pointer;
-    }
-
-    #controls-row {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    #btn-play-pause {
-      width: 72px;
-    }
-
-    #timecode {
-      font-variant-numeric: tabular-nums;
-      color: var(--muted);
-      margin-left: auto;
-    }
-
-    /* ── Meta info ──────────────────────────────────────────── */
-    #meta {
-      display: none;
-      width: 100%;
-      max-width: 900px;
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 10px 16px;
-      gap: 24px;
-      flex-wrap: wrap;
-    }
-    #meta.visible { display: flex; }
-    .meta-item { display: flex; flex-direction: column; gap: 2px; }
-    .meta-label { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
-    .meta-value { font-size: 13px; color: #fff; font-variant-numeric: tabular-nums; }
-
-    /* ── Status / error bar ─────────────────────────────────── */
-    #status {
-      width: 100%;
-      max-width: 900px;
-      color: var(--muted);
-      font-size: 12px;
-      min-height: 16px;
-    }
-    #status.error { color: #ff6b6b; }
-  </style>
+  <title>NLE Studio</title>
+  <link rel="stylesheet" href="./styles/main.css" />
+  <link rel="stylesheet" href="./styles/components.css" />
 </head>
 <body>
 
-  <h1>NLE Server – Frame Player</h1>
+<div id="app">
 
-  <!-- Hidden fallback file input -->
-  <input type="file" id="file-input" accept="video/*" style="display:none" />
+  <!-- ── Top row ─────────────────────────────────────────────────────── -->
+  <div id="top-row">
 
-  <div id="drop-zone">
-    <p>Drop a video file here, or click to open</p>
-    <button id="btn-open">Open Video File</button>
-  </div>
+    <!-- Source Monitor (top-left) -->
+    <div id="source-monitor" class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Source</span>
+        <span class="panel-badge" id="source-clip-name"></span>
+      </div>
+      <div class="monitor-viewport">
+        <canvas id="source-canvas"></canvas>
+        <div class="monitor-empty" id="source-empty">
+          <p>No clip loaded</p>
+          <p class="hint">Double-click a clip in the Media Bin</p>
+        </div>
+      </div>
+      <div class="monitor-transport">
+        <div class="transport-timecode">
+          <span id="source-timecode">00:00:00:00</span>
+          <span class="transport-sep">/</span>
+          <span id="source-dur">00:00:00:00</span>
+        </div>
+        <div class="transport-controls">
+          <button class="btn-icon" id="source-btn-mark-in"   title="Mark In (I)"           disabled>⌙</button>
+          <button class="btn-icon" id="source-btn-step-back" title="Step Back (←)"          disabled>◁</button>
+          <button class="btn-icon btn-play" id="source-btn-play" title="Play/Pause (Space)" disabled>▶</button>
+          <button class="btn-icon" id="source-btn-step-fwd"  title="Step Forward (→)"       disabled>▷</button>
+          <button class="btn-icon" id="source-btn-mark-out"  title="Mark Out (O)"           disabled>⌜</button>
+        </div>
+        <div class="transport-io">
+          <button class="btn-sm" id="source-btn-insert"    disabled>Insert</button>
+          <button class="btn-sm" id="source-btn-overwrite" disabled>Overwrite</button>
+        </div>
+      </div>
+    </div>
 
-  <div id="canvas-wrap">
-    <canvas id="gl-canvas"></canvas>
-    <div id="loading-overlay"><span id="loading-text">Opening…</span></div>
-  </div>
+    <!-- Vertical divider -->
+    <div class="divider-v" id="divider-col"></div>
 
-  <div id="transport">
-    <div id="scrub-row">
-      <input type="range" id="scrubber" min="0" max="1000" value="0" step="1" />
+    <!-- Program Monitor (top-right) -->
+    <div id="program-monitor" class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Program</span>
+        <span class="panel-badge" id="program-seq-name"></span>
+      </div>
+      <div class="monitor-viewport">
+        <canvas id="gl-canvas"></canvas>
+        <div class="monitor-empty" id="program-empty">
+          <p>No sequence — add clips to the timeline</p>
+        </div>
+        <div class="loading-overlay" id="loading-overlay">
+          <span id="loading-text">Loading…</span>
+        </div>
+      </div>
+      <div class="monitor-transport">
+        <div class="transport-timecode">
+          <span id="timecode">00:00:00:00</span>
+          <span class="transport-sep">/</span>
+          <span id="duration-display">00:00:00:00</span>
+        </div>
+        <div class="transport-controls">
+          <button class="btn-icon" id="btn-step-back"  title="Step Back (←)"          disabled>◁</button>
+          <button class="btn-icon btn-play" id="btn-play-pause" title="Play/Pause (Space)" disabled>▶</button>
+          <button class="btn-icon" id="btn-step-fwd"   title="Step Forward (→)"        disabled>▷</button>
+        </div>
+      </div>
     </div>
-    <div id="controls-row">
-      <button id="btn-play-pause" disabled>Play</button>
-      <span id="timecode">00:00:00:00 / 00:00:00:00</span>
-    </div>
-  </div>
 
-  <div id="meta">
-    <div class="meta-item">
-      <span class="meta-label">Resolution</span>
-      <span class="meta-value" id="meta-res">—</span>
-    </div>
-    <div class="meta-item">
-      <span class="meta-label">FPS</span>
-      <span class="meta-value" id="meta-fps">—</span>
-    </div>
-    <div class="meta-item">
-      <span class="meta-label">Duration</span>
-      <span class="meta-value" id="meta-dur">—</span>
-    </div>
-    <div class="meta-item">
-      <span class="meta-label">Frames</span>
-      <span class="meta-value" id="meta-frames">—</span>
-    </div>
-    <div class="meta-item">
-      <span class="meta-label">Frame #</span>
-      <span class="meta-value" id="meta-frame-cur">—</span>
-    </div>
-  </div>
+  </div><!-- /top-row -->
 
-  <div id="status">Waiting for WASM module…</div>
+  <!-- Horizontal divider -->
+  <div class="divider-h" id="divider-row"></div>
 
-  <script type="module" src="./main.js"></script>
+  <!-- ── Bottom row ──────────────────────────────────────────────────── -->
+  <div id="bottom-row">
+
+    <!-- Media Bin (bottom-left) -->
+    <div id="media-bin" class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Media Bin</span>
+        <div class="panel-actions">
+          <button class="btn-sm" id="btn-import">Import…</button>
+          <button class="btn-sm" id="btn-save-project"  title="Save project (⌘S)">Save</button>
+          <button class="btn-sm" id="btn-load-project"  title="Load project">Load</button>
+        </div>
+      </div>
+
+      <!-- Drop overlay (shown while dragging files over the bin) -->
+      <div id="bin-drop-overlay" style="display:none;position:absolute;inset:0;background:rgba(79,143,255,.12);border:2px dashed var(--accent);border-radius:4px;pointer-events:none;z-index:5;align-items:center;justify-content:center;color:var(--accent);font-size:13px;">
+        Drop to import
+      </div>
+
+      <div id="media-bin-list" class="bin-list">
+        <div class="bin-empty" id="bin-empty-msg">
+          <p>No media imported</p>
+          <p class="hint">Click Import or drag files here</p>
+        </div>
+      </div>
+
+      <div id="status" class="status-bar">Waiting for WASM…</div>
+    </div>
+
+    <!-- Second vertical divider (same --col-w, keeps columns aligned) -->
+    <div class="divider-v" id="divider-col-2"></div>
+
+    <!-- Timeline (bottom-right) -->
+    <div id="timeline-panel" class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Timeline</span>
+        <div class="panel-actions">
+          <button class="btn-icon tool-btn active" id="tool-select" title="Select (V)">↖</button>
+          <button class="btn-icon tool-btn"        id="tool-razor"  title="Razor (C)">✂</button>
+          <button class="btn-icon tool-btn"        id="tool-hand"   title="Hand (H)">✋</button>
+          <span class="divider-sm"></span>
+          <span class="timecode-sm" id="timeline-timecode">00:00:00:00</span>
+        </div>
+      </div>
+      <canvas id="timeline-canvas"></canvas>
+    </div>
+
+  </div><!-- /bottom-row -->
+
+</div><!-- /app -->
+
+<!-- Hidden file inputs -->
+<input type="file" id="file-input-import" accept="video/*" multiple style="display:none" />
+
+<script type="module" src="./main.js"></script>
 </body>
 </html>

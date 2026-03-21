@@ -23,11 +23,13 @@ set(FFMPEG_LIB_DIR     "${FFMPEG_WASM_DIR}/lib")
 # ── Source files ─────────────────────────────────────────────────────────────
 add_executable(frame_server
     src/core/frame_server.cpp
+    src/core/timeline_engine.cpp
     src/core/bindings.cpp
 )
 
 target_include_directories(frame_server PRIVATE
     src/core
+    src/core/vendor
     ${FFMPEG_INCLUDE_DIR}
 )
 

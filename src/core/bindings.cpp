@@ -1,15 +1,12 @@
 #include <emscripten/bind.h>
 #include <emscripten/val.h>
 #include "frame_server.h"
+#include "timeline_engine.h"
 
 using namespace emscripten;
 
 // ---------------------------------------------------------------------------
-// Embind bindings
-//
-// open() now accepts a JS Uint8Array directly (emscripten::val), so the JS
-// side no longer needs to manage raw WASM heap pointers.  alloc_buffer /
-// free_buffer have been removed.
+// FrameServer bindings
 // ---------------------------------------------------------------------------
 
 EMSCRIPTEN_BINDINGS(nle_frame_server) {
@@ -26,4 +23,34 @@ EMSCRIPTEN_BINDINGS(nle_frame_server) {
         .function("decode_frame_at",  &FrameServer::decode_frame_at)
         .function("close",            &FrameServer::close)
         ;
+}
+
+// ---------------------------------------------------------------------------
+// TimelineEngine bindings
+// ---------------------------------------------------------------------------
+
+EMSCRIPTEN_BINDINGS(nle_timeline_engine) {
+    class_<TimelineEngine>("TimelineEngine")
+        .constructor<>()
+        .function("create_sequence",      &TimelineEngine::create_sequence)
+        .function("add_clip",             &TimelineEngine::add_clip)
+        .function("move_clip",            &TimelineEngine::move_clip)
+        .function("trim_clip",            &TimelineEngine::trim_clip)
+        .function("split_clip",           &TimelineEngine::split_clip)
+        .function("remove_clip",          &TimelineEngine::remove_clip)
+        .function("set_track_muted",      &TimelineEngine::set_track_muted)
+        .function("set_track_visible",    &TimelineEngine::set_track_visible)
+        .function("set_track_locked",     &TimelineEngine::set_track_locked)
+        .function("resolve_frame",        &TimelineEngine::resolve_frame)
+        .function("get_sequence_duration",&TimelineEngine::get_sequence_duration)
+        .function("get_sequence_json",    &TimelineEngine::get_sequence_json)
+        .function("load_sequence_json",   &TimelineEngine::load_sequence_json)
+        .function("pts_from_frame",       &TimelineEngine::pts_from_frame)
+        .function("frame_from_pts",       &TimelineEngine::frame_from_pts)
+        ;
+
+    // Module-level singleton getter
+    function("get_timeline_engine",
+             +[]() -> TimelineEngine* { return &get_timeline_engine(); },
+             allow_raw_pointers());
 }
