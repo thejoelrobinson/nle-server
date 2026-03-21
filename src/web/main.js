@@ -1,11 +1,12 @@
 /**
  * main.js – Application entry point
  *
- * Wires DOM events → FrameServerBridge → Player
+ * Wires DOM events → WasmBridge (FrameServerBridge) → Player
  */
 
-import { FrameServerBridge } from './frame_server.js';
+import { FrameServerBridge } from './wasm_bridge.js';
 import { Player }            from './player.js';
+import { formatTimecode }    from './timecode.js';
 
 // ── DOM refs ──────────────────────────────────────────────────────────────
 const dropZone      = document.getElementById('drop-zone');
@@ -29,18 +30,6 @@ const statusBar     = document.getElementById('status');
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-/** Format seconds as HH:MM:SS:FF (SMPTE-ish) */
-function formatTimecode(secs, fps) {
-  const f = Math.max(1, Math.round(fps));
-  const totalFrames = Math.floor(secs * f);
-  const ff = totalFrames % f;
-  const totalSec = Math.floor(totalFrames / f);
-  const ss = totalSec % 60;
-  const mm = Math.floor(totalSec / 60) % 60;
-  const hh = Math.floor(totalSec / 3600);
-  return [hh, mm, ss, ff].map(n => String(n).padStart(2, '0')).join(':');
-}
-
 function setStatus(msg, isError = false) {
   statusBar.textContent = msg;
   statusBar.className   = isError ? 'error' : '';
@@ -53,11 +42,10 @@ function setLoading(visible, text = 'Opening…') {
 
 // ── Player + Bridge ───────────────────────────────────────────────────────
 
-let player   = null;
-let bridge   = null;
-let duration = 0;
-let fps      = 24;
-let frameCount = 0;
+let player      = null;
+let bridge      = null;
+let duration    = 0;
+let fps         = 24;
 let isScrubbing = false;
 
 function initPlayer() {
@@ -76,8 +64,8 @@ function createBridge() {
   if (bridge) { bridge.destroy(); bridge = null; }
 
   bridge = new FrameServerBridge({
-    onFrame(rgba, w, h, pts) {
-      player.drawFrame(rgba, w, h);
+    onFrame(yuvFrame, pts) {
+      player.drawFrame(yuvFrame);
       if (!isScrubbing) {
         const progress = duration > 0 ? pts / duration : 0;
         scrubber.value = Math.round(progress * 1000);
@@ -96,13 +84,12 @@ function createBridge() {
     onError(msg) {
       setLoading(false);
       setStatus(msg, true);
-      console.error('[FrameServer]', msg);
+      console.error('[FrameServer]', msg); // eslint-disable-line no-console
     },
 
     onMetadata(meta) {
-      duration   = meta.duration;
-      fps        = meta.fps;
-      frameCount = meta.frameCount;
+      duration = meta.duration;
+      fps      = meta.fps;
 
       setLoading(false);
       canvasWrap.classList.add('visible');
@@ -254,16 +241,21 @@ document.addEventListener('keydown', (e) => {
 
 // ── Init status ───────────────────────────────────────────────────────────
 
-// Pre-warm the WASM bridge so the module starts loading immediately.
-// We create a silent bridge just to trigger the WASM fetch.
+// Pre-warm: start fetching + compiling the WASM module in the background so
+// it's ready by the time the user picks a file.  The open button is always
+// active — we don't gate it on WASM readiness.
+setStatus('Loading WASM module…');
+
 const _warmup = new FrameServerBridge({
   onFrame:    () => {},
   onEnd:      () => {},
-  onError:    (msg) => setStatus(msg, true),
+  onError:    (msg) => {
+    setStatus('WASM error: ' + msg, true);
+    console.error('[warmup]', msg); // eslint-disable-line no-console
+  },
   onMetadata: () => {},
 });
-_warmup.ready().then(() => {
-  setStatus('Ready – open a video file to begin.');
-}).catch(() => {
-  // Error already reported via onError callback
-});
+
+_warmup.ready()
+  .then(() => setStatus('Ready – open a video file to begin.'))
+  .catch(() => { /* onError above already updated the status bar */ });

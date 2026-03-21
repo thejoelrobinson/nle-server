@@ -1,23 +1,28 @@
 /**
- * frame_server.js – JS bridge around the WASM FrameServer module
+ * wasm_bridge.js – JS bridge around the Emscripten WASM FrameServer module
  *
  * Responsibilities:
  *  - Load and instantiate the WASM module
  *  - Copy file bytes into WASM heap via alloc_buffer / free_buffer
  *  - Drive playback via requestAnimationFrame
  *  - Expose openFile / play / pause / seekTo to main.js
+ *
+ * Naming note: this file is intentionally NOT called frame_server.js.
+ * The Emscripten-generated loader is also called frame_server.js (served at
+ * /wasm/frame_server.js via Vite's publicDir).  Sharing the base name caused
+ * Vite to serve the Emscripten file when the bridge was imported, breaking
+ * the module graph.  Different base names eliminate the collision permanently.
  */
 
-// Path to the generated Emscripten JS loader (placed in /build/ by CMake).
-// Vite serves the entire project root, so /build/frame_server.js is reachable.
-const WASM_JS_URL = '/build/frame_server.js';
+// Emscripten artifacts are in build/wasm/, served by Vite's publicDir at /wasm/.
+// We load via fetch() + blob URL rather than dynamic import() to keep this file
+// out of Vite's module resolver path for that URL.
+const WASM_JS_URL = '/wasm/frame_server.js';
 
 export class FrameServerBridge {
   constructor({ onFrame, onEnd, onError, onMetadata }) {
-    this._mod        = null;   // Emscripten module instance
-    this._server     = null;   // FrameServer C++ object (Embind wrapper)
-    this._heapPtr    = 0;      // pointer into WASM heap for file data
-    this._heapSize   = 0;
+    this._mod    = null;   // Emscripten module instance
+    this._server = null;   // FrameServer C++ object (Embind wrapper)
 
     // Playback state
     this._playing    = false;
@@ -42,13 +47,51 @@ export class FrameServerBridge {
 
   async _loadWasm() {
     try {
-      // Dynamically import the Emscripten ES6 module
-      const { default: createModule } = await import(/* @vite-ignore */ WASM_JS_URL);
-      this._mod = await createModule();
+      // 1. Fetch the Emscripten JS loader as plain text.
+      //    fetch() bypasses Vite's module resolver entirely.
+      const res = await fetch(WASM_JS_URL);
+      if (!res.ok) {
+        throw new Error(
+          `GET ${WASM_JS_URL} → HTTP ${res.status}. ` +
+          'Have you run scripts/build_wasm.sh? (see README.md)'
+        );
+      }
+      const src = await res.text();
+
+      // 2. Wrap in a blob URL so import() treats it as an external module.
+      //    A blob URL is same-origin, compatible with COEP, and invisible to
+      //    Vite's module graph — no circular-import risk.
+      const blobUrl = URL.createObjectURL(
+        new Blob([src], { type: 'application/javascript' })
+      );
+      let createModule;
+      try {
+        ({ default: createModule } = await import(/* @vite-ignore */ blobUrl));
+      } finally {
+        // Release the blob immediately; the module is already parsed.
+        URL.revokeObjectURL(blobUrl);
+      }
+
+      // 3. Instantiate.  Pass locateFile so Emscripten fetches the .wasm from
+      //    the right URL rather than resolving relative to the blob URL.
+      let swscaleWarned = false;
+      this._mod = await createModule({
+        locateFile: (name) => `/wasm/${name}`,
+        print:    () => {},
+        printErr: (msg) => {
+          if (msg.includes('No accelerated colorspace conversion')) {
+            if (!swscaleWarned) {
+              console.info('[FrameServer] Using software YUV→RGBA conversion (normal in WASM)'); // eslint-disable-line no-console
+              swscaleWarned = true;
+            }
+            return;
+          }
+          console.warn('[FrameServer]', msg); // eslint-disable-line no-console
+        },
+      });
     } catch (err) {
-      const msg = `Failed to load WASM module: ${err.message}\n\n` +
-                  'Have you built the WASM module? See README.md for instructions.\n' +
-                  'Running the dev server without a built WASM is expected during setup.';
+      const msg = `WASM init failed: ${err.message}`;
+      console.error('[FrameServerBridge]', err); // eslint-disable-line no-console
       this._onError(msg);
       throw err;
     }
@@ -68,36 +111,31 @@ export class FrameServerBridge {
   async openFile(file) {
     await this.ready();
     this.pause();
-    this._freeHeap();
     if (this._server) { this._server.close(); this._server.delete(); this._server = null; }
 
-    // Read the entire file into a JS ArrayBuffer
-    const arrayBuf = await file.arrayBuffer();
-    const bytes    = new Uint8Array(arrayBuf);
+    // Read file into a Uint8Array and pass it directly to the C++ open() via
+    // Embind — no manual WASM heap management needed.
+    const bytes = new Uint8Array(await file.arrayBuffer());
 
-    // Allocate WASM heap and copy bytes
-    this._heapSize = bytes.byteLength;
-    this._heapPtr  = this._mod.alloc_buffer(this._heapSize);
-    if (!this._heapPtr) throw new Error('WASM heap allocation failed');
-
-    // Write into WASM linear memory
-    this._mod.HEAPU8.set(bytes, this._heapPtr);
-
-    // Create and open the FrameServer
     this._server = new this._mod.FrameServer();
-    const ok = this._server.open(file.name, this._heapPtr, this._heapSize);
+    const ok = this._server.open(file.name, bytes);
     if (!ok) {
-      this._freeHeap();
       this._server.delete();
       this._server = null;
       throw new Error('FrameServer.open() failed – unsupported format or corrupt file');
     }
 
-    // We no longer need the heap copy (FrameServer::open() copied it internally)
-    this._freeHeap();
+    const w = this._server.get_width();
+    const h = this._server.get_height();
+    if (w === 0 || h === 0) {
+      this._server.close();
+      this._server.delete();
+      this._server = null;
+      throw new Error(`Invalid video dimensions: ${w}×${h}`);
+    }
 
-    this._width    = this._server.get_width();
-    this._height   = this._server.get_height();
+    this._width    = w;
+    this._height   = h;
     this._fps      = this._server.get_fps() || 24;
     this._duration = this._server.get_duration();
     const frameCount = this._server.get_frame_count();
@@ -128,17 +166,20 @@ export class FrameServerBridge {
   }
 
   /**
-   * Seek to a position (seconds) and decode the nearest frame.
+   * Seek to a position (seconds) and decode the exact frame at that position.
+   * Uses decode_frame_at() which seeks to the preceding keyframe, flushes the
+   * codec, then decodes forward until reaching the target PTS — giving accurate
+   * frame-level seek for long-GOP codecs like MPEG-2.
    * @param {number} seconds
    */
   seekTo(seconds) {
     if (!this._server) return;
-    const wasPlaing = this._playing;
+    const wasPlaying = this._playing;
     this.pause();
     this._pts = Math.max(0, Math.min(seconds, this._duration));
-    this._server.seek(this._pts);
-    this._decodeSingleFrame();
-    if (wasPlaing) this.play();
+    const frame = this._server.decode_frame_at(this._pts);
+    if (frame) this._onFrame(frame, this._pts);
+    if (wasPlaying) this.play();
   }
 
   get isPlaying()  { return this._playing; }
@@ -167,46 +208,24 @@ export class FrameServerBridge {
       return;
     }
 
-    const frameData = this._server.decode_next_frame();
-    if (frameData === null || frameData === undefined) {
+    const frame = this._server.decode_next_frame();
+    if (!frame) {
       // Decoder returned nothing – either EOF or decode error
       this.pause();
       this._onEnd();
       return;
     }
 
-    // decode_next_frame() returns a typed_memory_view – copy it before the
-    // next call could invalidate it (the backing buffer is reused each frame).
-    const copy = new Uint8ClampedArray(frameData.length);
-    copy.set(frameData);
-
-    this._onFrame(copy, this._width, this._height, this._pts);
+    // Pass the YUV frame object directly — gl.texImage2D consumes the
+    // WASM-backed typed_memory_views synchronously before the next decode.
+    this._onFrame(frame, this._pts);
     this._scheduleRaf();
-  }
-
-  /** Decode and display exactly one frame at the current position. */
-  _decodeSingleFrame() {
-    if (!this._server) return;
-    const frameData = this._server.decode_next_frame();
-    if (!frameData) return;
-    const copy = new Uint8ClampedArray(frameData.length);
-    copy.set(frameData);
-    this._onFrame(copy, this._width, this._height, this._pts);
   }
 
   // ── Cleanup ───────────────────────────────────────────────────────────────
 
-  _freeHeap() {
-    if (this._heapPtr) {
-      this._mod.free_buffer(this._heapPtr);
-      this._heapPtr  = 0;
-      this._heapSize = 0;
-    }
-  }
-
   destroy() {
     this.pause();
     if (this._server) { this._server.close(); this._server.delete(); this._server = null; }
-    this._freeHeap();
   }
 }

@@ -1,26 +1,36 @@
 /**
- * player.js – WebGL1 frame renderer
+ * player.js – WebGL1 YUV frame renderer
  *
- * Accepts raw RGBA Uint8Array frames and displays them on a <canvas> using a
- * simple fullscreen-quad shader.  WebGL1 is used for maximum browser compat.
+ * Accepts raw YUV420P planes from the WASM decoder and converts them to RGB
+ * entirely on the GPU via a BT.601 fragment shader.  Three LUMINANCE textures
+ * (Y, U, V) replace the single RGBA texture, eliminating the sws_scale CPU
+ * conversion step.
  */
 
 const VERT_SRC = `
 attribute vec2 a_pos;
 attribute vec2 a_uv;
-varying   vec2 v_uv;
+varying   vec2 vTexCoord;
 void main() {
-  v_uv        = a_uv;
+  vTexCoord   = a_uv;
   gl_Position = vec4(a_pos, 0.0, 1.0);
 }
 `;
 
 const FRAG_SRC = `
 precision mediump float;
-uniform sampler2D u_tex;
-varying vec2 v_uv;
+uniform sampler2D uTextureY;
+uniform sampler2D uTextureU;
+uniform sampler2D uTextureV;
+varying vec2 vTexCoord;
 void main() {
-  gl_FragColor = texture2D(u_tex, v_uv);
+  float y = texture2D(uTextureY, vTexCoord).r;
+  float u = texture2D(uTextureU, vTexCoord).r - 0.5;
+  float v = texture2D(uTextureV, vTexCoord).r - 0.5;
+  float r = y + 1.402 * v;
+  float g = y - 0.344 * u - 0.714 * v;
+  float b = y + 1.772 * u;
+  gl_FragColor = vec4(r, g, b, 1.0);
 }
 `;
 
@@ -49,6 +59,8 @@ export class Player {
    */
   constructor(canvas) {
     this.canvas = canvas;
+    this.width  = 0;
+    this.height = 0;
 
     const gl = canvas.getContext('webgl', {
       antialias: false,
@@ -60,9 +72,17 @@ export class Player {
     this.gl = gl;
 
     this._initGL();
-    this.width  = 0;
-    this.height = 0;
-    this.texture = null;
+  }
+
+  _createTexture() {
+    const gl  = this.gl;
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S,     gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T,     gl.CLAMP_TO_EDGE);
+    return tex;
   }
 
   _initGL() {
@@ -84,32 +104,65 @@ export class Player {
     gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
 
     // ── Shader program ───────────────────────────────────────────────────
-    this.prog    = createProgram(gl, VERT_SRC, FRAG_SRC);
-    this.loc_pos = gl.getAttribLocation(this.prog, 'a_pos');
-    this.loc_uv  = gl.getAttribLocation(this.prog, 'a_uv');
-    this.loc_tex = gl.getUniformLocation(this.prog, 'u_tex');
+    this.prog       = createProgram(gl, VERT_SRC, FRAG_SRC);
+    this.loc_pos    = gl.getAttribLocation(this.prog, 'a_pos');
+    this.loc_uv     = gl.getAttribLocation(this.prog, 'a_uv');
+    this.loc_texY   = gl.getUniformLocation(this.prog, 'uTextureY');
+    this.loc_texU   = gl.getUniformLocation(this.prog, 'uTextureU');
+    this.loc_texV   = gl.getUniformLocation(this.prog, 'uTextureV');
 
-    // ── Texture (allocated lazily on first frame) ────────────────────────
-    this.texture = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, this.texture);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S,     gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T,     gl.CLAMP_TO_EDGE);
+    // ── Three LUMINANCE textures for Y, U, V planes ──────────────────────
+    this.textureY = this._createTexture();
+    this.textureU = this._createTexture();
+    this.textureV = this._createTexture();
 
     gl.clearColor(0, 0, 0, 1);
   }
 
   /**
-   * Upload an RGBA frame and draw it.
-   * @param {Uint8Array|Uint8ClampedArray} rgba  – width*height*4 bytes
-   * @param {number} width
-   * @param {number} height
+   * Upload a single luminance plane and handle stride padding.
+   * WebGL1 has no UNPACK_ROW_LENGTH, so rows with padding must be stripped.
+   *
+   * @param {WebGLTexture} texture
+   * @param {Uint8Array}   data    – raw plane bytes (may include row padding)
+   * @param {number}       width   – logical pixel width of this plane
+   * @param {number}       height  – logical pixel height of this plane
+   * @param {number}       stride  – bytes per row (>= width when padded)
    */
-  drawFrame(rgba, width, height) {
+  _uploadPlane(texture, data, width, height, stride) {
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+
+    let pixels;
+    if (stride === width) {
+      pixels = data;
+    } else {
+      // Strip row padding into a tightly packed buffer
+      pixels = new Uint8Array(width * height);
+      for (let row = 0; row < height; row++) {
+        pixels.set(
+          data.subarray(row * stride, row * stride + width),
+          row * width
+        );
+      }
+    }
+
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.LUMINANCE,
+      width, height, 0,
+      gl.LUMINANCE, gl.UNSIGNED_BYTE,
+      pixels
+    );
+  }
+
+  /**
+   * Upload a YUV420P frame and draw it.
+   * @param {{ y, u, v, width, height, strideY, strideU, strideV }} frame
+   */
+  drawFrame({ y, u, v, width, height, strideY, strideU, strideV }) {
     const gl = this.gl;
 
-    // Resize canvas backing store if needed
+    // Resize canvas backing store if dimensions changed
     if (this.canvas.width !== width || this.canvas.height !== height) {
       this.canvas.width  = width;
       this.canvas.height = height;
@@ -118,14 +171,10 @@ export class Player {
       this.height = height;
     }
 
-    // Upload texture
-    gl.bindTexture(gl.TEXTURE_2D, this.texture);
-    gl.texImage2D(
-      gl.TEXTURE_2D, 0, gl.RGBA,
-      width, height, 0,
-      gl.RGBA, gl.UNSIGNED_BYTE,
-      rgba instanceof Uint8ClampedArray ? rgba : new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.byteLength)
-    );
+    // Upload the three planes
+    this._uploadPlane(this.textureY, y, width,    height,    strideY);
+    this._uploadPlane(this.textureU, u, width>>1, height>>1, strideU);
+    this._uploadPlane(this.textureV, v, width>>1, height>>1, strideV);
 
     // Draw
     gl.clear(gl.COLOR_BUFFER_BIT);
@@ -139,20 +188,29 @@ export class Player {
     gl.vertexAttribPointer(this.loc_uv,  2, gl.FLOAT, false, stride, 8);
 
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.texture);
-    gl.uniform1i(this.loc_tex, 0);
+    gl.bindTexture(gl.TEXTURE_2D, this.textureY);
+    gl.uniform1i(this.loc_texY, 0);
+
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.textureU);
+    gl.uniform1i(this.loc_texU, 1);
+
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, this.textureV);
+    gl.uniform1i(this.loc_texV, 2);
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
   clear() {
-    const gl = this.gl;
-    gl.clear(gl.COLOR_BUFFER_BIT);
+    this.gl.clear(this.gl.COLOR_BUFFER_BIT);
   }
 
   destroy() {
     const gl = this.gl;
-    gl.deleteTexture(this.texture);
+    gl.deleteTexture(this.textureY);
+    gl.deleteTexture(this.textureU);
+    gl.deleteTexture(this.textureV);
     gl.deleteBuffer(this.vbo);
     gl.deleteProgram(this.prog);
   }

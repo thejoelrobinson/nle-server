@@ -93,6 +93,7 @@ emconfigure ./configure \
     --enable-decoder=av1 \
     --enable-decoder=prores \
     --enable-decoder=dnxhd \
+    --enable-decoder=mpeg2video \
     --enable-decoder=mpeg4 \
     --enable-decoder=mjpeg \
     --enable-decoder=png \
@@ -102,6 +103,7 @@ emconfigure ./configure \
     --enable-demuxer=mp4 \
     --enable-demuxer=avi \
     --enable-demuxer=mpegts \
+    --enable-demuxer=mxf \
     --enable-demuxer=image2 \
     \
     --enable-protocol=file \
@@ -110,8 +112,10 @@ emconfigure ./configure \
     --enable-parser=hevc \
     --enable-parser=vp9 \
     --enable-parser=av1 \
+    --enable-parser=mpegvideo \
     --enable-parser=mpeg4video \
     --enable-parser=mjpeg \
+    --enable-parser=dnxhd \
     \
     --extra-cflags="-O3" \
     --extra-cxxflags="-O3"
