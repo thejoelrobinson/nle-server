@@ -1,4 +1,5 @@
 import { FrameCache } from './frame_cache.js';
+import { frameDurationUs, usToSecs } from './timecode.js';
 
 /**
  * playback.js – Timeline playback engine.
@@ -14,23 +15,32 @@ import { FrameCache } from './frame_cache.js';
  *  - Timeline is updated directly (_timeline._playhead + render()) during
  *    the rAF tick to avoid dispatching 'playhead-change', which would
  *    trigger the scrub listener and kill playback.
- *  - decodeAndDisplay is synchronous (FrameServerPool.decodeFrameAt is
- *    a synchronous WASM call). If decode is slow the next tick's larger
- *    elapsed value naturally skips frames to stay in sync.
+ *  - decodeAndDisplay is fire-and-forget (async internally but caller doesn't wait).
+ *    If decode is slow the next tick's larger elapsed value naturally skips frames
+ *    to stay in sync.
  */
 
 import { AudioEngine } from './audio_engine.js';
 
+// FFmpeg AVCOL_SPC_* values
+const AVCOL_SPC_BT709 = 1;
+const AVCOL_SPC_BT2020_NCL = 9;
+
+// Player colorspace indices: 0=BT.601, 1=BT.709, 2=BT.2020
+const COLORSPACE_BT601 = 0;
+const COLORSPACE_BT709 = 1;
+const COLORSPACE_BT2020 = 2;
+const COLORSPACE_DEFAULT = COLORSPACE_BT601;
+
 /**
  * Map FFmpeg AVCOL_SPC_* value to player colorspace index.
- * 0 = BT.601, 1 = BT.709, 2 = BT.2020
  * @param {number} avcol_spc
  * @returns {number}
  */
 function mapFFmpegColorspace(avcol_spc) {
-  if (avcol_spc === 1) return 1;   // AVCOL_SPC_BT709
-  if (avcol_spc === 9) return 2;   // AVCOL_SPC_BT2020_NCL
-  return 0;                         // BT.601 default
+  if (avcol_spc === AVCOL_SPC_BT709) return COLORSPACE_BT709;
+  if (avcol_spc === AVCOL_SPC_BT2020_NCL) return COLORSPACE_BT2020;
+  return COLORSPACE_DEFAULT;
 }
 
 export class Playback {
@@ -82,8 +92,9 @@ export class Playback {
 
   // ── Getters ───────────────────────────────────────────────────────────────
 
-  get isPlaying()   { return this._isPlaying; }
-  get playheadPts() { return this._playheadPts; }
+  get isPlaying()       { return this._isPlaying; }
+  get playheadPts()     { return this._playheadPts; }
+  get _frameDurationUs() { return Math.round((1 / this._fps) * 1e6); }
 
   // ── Configuration (call when sequence settings change) ────────────────────
 
@@ -130,17 +141,15 @@ export class Playback {
 
   stepForward() {
     this.pause();
-    const step = Math.round((1 / this._fps) * 1e6);
     this.syncPlayheadPts(Math.min(
-      this._playheadPts + step,
-      this._duration > 0 ? this._duration : this._playheadPts + step,
+      this._playheadPts + this._frameDurationUs,
+      this._duration > 0 ? this._duration : this._playheadPts + this._frameDurationUs,
     ));
   }
 
   stepBack() {
     this.pause();
-    const step = Math.round((1 / this._fps) * 1e6);
-    this.syncPlayheadPts(Math.max(this._playheadPts - step, 0));
+    this.syncPlayheadPts(Math.max(this._playheadPts - this._frameDurationUs, 0));
   }
 
   /**
@@ -154,9 +163,23 @@ export class Playback {
     this._playheadPts      = pts;
     this._prefetchInflight = false;
     this._cache.clear();
-    if (this._timeline) { this._timeline._playhead = pts; this._timeline.render(); }
+    this._updateTimelineDisplay(pts);
     this._onTimecode?.(pts);
     this._decodeAndDisplay(pts);
+  }
+
+  // ── Internal helpers ─────────────────────────────────────────────────────
+
+  /**
+   * Update timeline display without firing 'playhead-change' event.
+   * Directly mutates timeline internal state to avoid triggering scrub listener.
+   * @param {number} pts — playhead position in µs
+   */
+  _updateTimelineDisplay(pts) {
+    if (this._timeline) {
+      this._timeline._playhead = pts;
+      this._timeline.render();
+    }
   }
 
   // ── Internal rAF loop ─────────────────────────────────────────────────────
@@ -176,7 +199,7 @@ export class Playback {
     if (this._duration > 0) this._playheadPts = Math.min(this._playheadPts, this._duration);
 
     // Update timeline display without firing 'playhead-change'
-    if (this._timeline) { this._timeline._playhead = this._playheadPts; this._timeline.render(); }
+    this._updateTimelineDisplay(this._playheadPts);
     this._onTimecode?.(this._playheadPts);
     this._decodeAndDisplay(this._playheadPts);
     this._schedulePrefetch(this._playheadPts);
@@ -199,7 +222,7 @@ export class Playback {
       if (!this._engine || !this._seqId || !this._pool) return;
       const resolved = this._engine.resolve_frame(this._seqId, pts);
       if (!resolved?.source_path) return;
-      const targetSecs = pts / 1e6;
+      const targetSecs = usToSecs(pts);
       // Skip if we already decoded audio very recently (< 80 ms lookahead gap)
       if (Math.abs(targetSecs - this._lastAudioPts) < 0.08) return;
       this._lastAudioPts = targetSecs;
@@ -208,20 +231,20 @@ export class Playback {
     } catch (_e) { /* non-fatal — video keeps playing */ }
   }
 
-  async _decodeAndDisplay(pts) {
+  _decodeAndDisplay(pts) {
     if (!this._engine || !this._seqId || !this._pool) return;
     try {
       const resolved = this._engine.resolve_frame(this._seqId, pts);
       if (!resolved || !resolved.source_path) { this._onFrameState?.(false); return; }
 
       const info = this._pool.getInfo(resolved.source_path);
-      const colorspace = mapFFmpegColorspace(info?.colorspace ?? 5);
+      const colorspace = mapFFmpegColorspace(info?.colorspace ?? AVCOL_SPC_BT709);
 
       let frame = this._cache.get(resolved.source_path, resolved.source_pts);
       if (!frame) {
         // source_pts is always in NLE timebase (µs) — both the JS mirror and the
         // C++ engine (which defaults to tb_den=1000000) store clip PTS in µs.
-        frame = await this._pool.decodeFrameAt(resolved.source_path, resolved.source_pts / 1e6);
+        frame = this._pool.decodeFrameAt(resolved.source_path, usToSecs(resolved.source_pts));
         if (frame) this._cache.set(resolved.source_path, resolved.source_pts, frame);
       }
 
@@ -238,7 +261,7 @@ export class Playback {
     if (this._prefetchInflight) return;
     this._prefetchInflight = true;
 
-    const frameDuration = 1_000_000 / this._fps;
+    const frameDuration = frameDurationUs(this._fps);
 
     (async () => {
       try {
@@ -253,7 +276,7 @@ export class Playback {
 
           const frame = await this._pool.decodeFrameAt(
             resolved.source_path,
-            resolved.source_pts / 1e6
+            usToSecs(resolved.source_pts)
           );
           if (frame) this._cache.set(resolved.source_path, resolved.source_pts, frame);
         }
