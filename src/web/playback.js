@@ -19,6 +19,8 @@ import { FrameCache } from './frame_cache.js';
  *    elapsed value naturally skips frames to stay in sync.
  */
 
+import { AudioEngine } from './audio_engine.js';
+
 /**
  * Map FFmpeg AVCOL_SPC_* value to player colorspace index.
  * 0 = BT.601, 1 = BT.709, 2 = BT.2020
@@ -71,6 +73,11 @@ export class Playback {
     this._onStateChange = onPlayStateChange;
     this._onTimecode    = onTimecodeUpdate;
     this._onFrameState  = onFrameState;
+
+    // Audio
+    this._audio            = new AudioEngine();
+    this._audioInitialized = false;
+    this._lastAudioPts     = -1;
   }
 
   // ── Getters ───────────────────────────────────────────────────────────────
@@ -95,6 +102,13 @@ export class Playback {
     if (this._isPlaying) return;
     this._isPlaying   = true;
     this._lastFrameMs = null;
+    // Audio init must happen inside a user-gesture handler; play() is one.
+    if (!this._audioInitialized) {
+      this._audio.init().then(() => { this._audio.start(); });
+      this._audioInitialized = true;
+    } else {
+      this._audio.start();
+    }
     this._rafId = requestAnimationFrame((now) => this._tick(now));
     this._onStateChange?.(true);
   }
@@ -106,6 +120,7 @@ export class Playback {
     this._prefetchInflight = false;
     this._cache.clear();
     if (this._rafId !== null) { cancelAnimationFrame(this._rafId); this._rafId = null; }
+    this._audio.stop();
     this._onStateChange?.(false);
   }
 
@@ -165,6 +180,7 @@ export class Playback {
     this._onTimecode?.(this._playheadPts);
     this._decodeAndDisplay(this._playheadPts);
     this._schedulePrefetch(this._playheadPts);
+    this._decodeAndPushAudio(this._playheadPts);
 
     // Stop at end of sequence
     if (this._duration > 0 && this._playheadPts >= this._duration) {
@@ -176,6 +192,20 @@ export class Playback {
     }
 
     this._rafId = requestAnimationFrame((now2) => this._tick(now2));
+  }
+
+  _decodeAndPushAudio(pts) {
+    try {
+      if (!this._engine || !this._seqId || !this._pool) return;
+      const resolved = this._engine.resolve_frame(this._seqId, pts);
+      if (!resolved?.source_path) return;
+      const targetSecs = pts / 1e6;
+      // Skip if we already decoded audio very recently (< 80 ms lookahead gap)
+      if (Math.abs(targetSecs - this._lastAudioPts) < 0.08) return;
+      this._lastAudioPts = targetSecs;
+      const samples = this._pool.decodeAudioAt(resolved.source_path, targetSecs, 8192);
+      if (samples?.length > 0) this._audio.pushSamples(samples);
+    } catch (_e) { /* non-fatal — video keeps playing */ }
   }
 
   async _decodeAndDisplay(pts) {

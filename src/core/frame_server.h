@@ -8,8 +8,10 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
 #include <libavutil/frame.h>
 #include <libavutil/opt.h>
+#include <libavutil/channel_layout.h>
 }
 
 #include <emscripten/bind.h>
@@ -36,6 +38,8 @@ public:
     bool seek(double timestamp_seconds);
     emscripten::val decode_next_frame();
     emscripten::val get_stream_info();
+    bool has_audio();
+    emscripten::val decode_audio_at(double target_seconds, int num_samples);
 
     /**
      * Seek to the keyframe before target_seconds, flush the codec, then decode
@@ -84,10 +88,15 @@ private:
     AVPacket*            packet_    = nullptr;
     SwsContext*          sws_ctx_   = nullptr;   // only created if src != yuv420p
 
-    int video_stream_idx_ = -1;
+    int video_stream_idx_   = -1;
+    int _audio_stream_index = -1;
     int width_  = 0;
     int height_ = 0;
 
     // Proxy generation
     emscripten::val _proxy_progress_cb_ = emscripten::val::undefined();
+
+    // Audio decode
+    AVCodecContext* _audio_codec_ctx = nullptr;
+    SwrContext*     _swr_ctx         = nullptr;
 };

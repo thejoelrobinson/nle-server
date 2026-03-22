@@ -74,11 +74,11 @@ emconfigure ./configure \
     --disable-avdevice \
     --disable-avfilter \
     --disable-postproc \
-    --disable-swresample \
     \
     --enable-avformat \
     --enable-avcodec \
     --enable-swscale \
+    --enable-swresample \
     --enable-avutil \
     \
     --enable-static \
@@ -97,6 +97,15 @@ emconfigure ./configure \
     --enable-decoder=mpeg4 \
     --enable-decoder=mjpeg \
     --enable-decoder=png \
+    --enable-decoder=aac \
+    --enable-decoder=mp3 \
+    --enable-decoder=ac3 \
+    --enable-decoder=pcm_s16le \
+    --enable-decoder=pcm_s24le \
+    --enable-decoder=pcm_f32le \
+    --enable-decoder=flac \
+    --enable-decoder=opus \
+    --enable-decoder=vorbis \
     \
     --enable-encoder=mjpeg \
     \
@@ -121,6 +130,8 @@ emconfigure ./configure \
     --enable-parser=mpeg4video \
     --enable-parser=mjpeg \
     --enable-parser=dnxhd \
+    --enable-parser=aac \
+    --enable-parser=mp3 \
     \
     --extra-cflags="-O3" \
     --extra-cxxflags="-O3"
