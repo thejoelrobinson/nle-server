@@ -459,7 +459,8 @@ function _buildJsMirrorEngine() {
         for (const c of t.clips) {
           if (pts >= c.timeline_in_pts && pts < c.timeline_out_pts) {
             return { source_path: c.source_path,
-                     source_pts: (c.source_in_pts + (pts - c.timeline_in_pts)) / NLE_TIME_BASE };
+                     source_pts: c.source_in_pts + (pts - c.timeline_in_pts),
+                     colorspace: c.colorspace ?? 5 };
           }
         }
       }

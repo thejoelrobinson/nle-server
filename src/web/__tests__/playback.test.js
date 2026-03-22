@@ -21,7 +21,7 @@ function makeEngine(resolveResult = null) {
 }
 
 function makePool(frame = null) {
-  return { decodeFrameAt: vi.fn().mockReturnValue(frame) };
+  return { decodeFrameAt: vi.fn().mockReturnValue(frame), getInfo: vi.fn().mockReturnValue(null) };
 }
 
 function makePlayer() {
@@ -421,7 +421,7 @@ describe('Playback', () => {
     });
 
     it('calls pool.decodeFrameAt when resolve_frame returns a result', () => {
-      const engine = makeEngine({ source_path: 'clip.mp4', source_pts: 2.5 });
+      const engine = makeEngine({ source_path: 'clip.mp4', source_pts: 2500000 });
       const pool   = makePool();
       const pb     = makePlayback({ engine, pool });
       pb._decodeAndDisplay(5 * SEC);
@@ -430,18 +430,18 @@ describe('Playback', () => {
 
     it('calls player.drawFrame when a frame is decoded', () => {
       const fakeFrame = { y: new Uint8Array(4), width: 2, height: 2 };
-      const engine    = makeEngine({ source_path: 'clip.mp4', source_pts: 1.0 });
+      const engine    = makeEngine({ source_path: 'clip.mp4', source_pts: 1000000});
       const pool      = makePool(fakeFrame);
       const player    = makePlayer();
       const pb        = makePlayback({ engine, pool });
       pb.setProgramPlayer(player);
       pb._decodeAndDisplay(1 * SEC);
-      expect(player.drawFrame).toHaveBeenCalledWith(fakeFrame);
+      expect(player.drawFrame).toHaveBeenCalledWith(expect.objectContaining(fakeFrame));
     });
 
     it('calls onFrameState(true) when a frame is decoded and drawn', () => {
       const fakeFrame    = { y: new Uint8Array(4), width: 2, height: 2 };
-      const engine       = makeEngine({ source_path: 'clip.mp4', source_pts: 1.0 });
+      const engine       = makeEngine({ source_path: 'clip.mp4', source_pts: 1000000});
       const pool         = makePool(fakeFrame);
       const player       = makePlayer();
       const onFrameState = vi.fn();
@@ -453,7 +453,7 @@ describe('Playback', () => {
 
     it('does not call player.drawFrame when player is not set', () => {
       const fakeFrame = { y: new Uint8Array(4), width: 2, height: 2 };
-      const engine    = makeEngine({ source_path: 'clip.mp4', source_pts: 1.0 });
+      const engine    = makeEngine({ source_path: 'clip.mp4', source_pts: 1000000});
       const pool      = makePool(fakeFrame);
       const pb        = makePlayback({ engine, pool });
       // _player is null — should not throw

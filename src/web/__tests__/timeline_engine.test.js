@@ -201,7 +201,8 @@ class TimelineEngine {
           const sourcePts = clip.source_in_pts + offset;
           return {
             source_path: clip.source_path,
-            source_pts:  sourcePts / NLE_TIME_BASE,
+            source_pts:  sourcePts,
+            colorspace:  clip.colorspace ?? 5,
           };
         }
       }
@@ -493,8 +494,8 @@ describe('resolve_frame()', () => {
     const result = engine.resolve_frame(seqId, 12 * SEC);
     expect(result).not.toBeNull();
     expect(result.source_path).toBe('hero.mp4');
-    // 12s into timeline = 2s into clip = source 5+2 = 7s → 7.0
-    expect(result.source_pts).toBeCloseTo(7.0, 5);
+    // 12s into timeline = 2s into clip = source 5+2 = 7s → 7 * SEC µs
+    expect(result.source_pts).toBe(7 * SEC);
   });
 
   it('returns null for a gap between clips', () => {
