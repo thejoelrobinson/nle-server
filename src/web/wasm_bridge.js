@@ -197,14 +197,17 @@ export class FrameServerBridge {
 export class FrameServerPool {
   constructor() {
     this._bridges = new Map();  // source_path → FrameServerBridge
+    this._files   = new Map();  // source_path → File  (kept so bridges can be re-opened)
   }
 
   /**
    * Open a File and add it to the pool, keyed by file.name.
+   * Also registers the File object for future reference.
    * No-op if already loaded.
    * @param {File} file
    */
   async addFile(file) {
+    this._files.set(file.name, file);           // always refresh the File reference
     if (this._bridges.has(file.name)) return;
 
     const bridge = new FrameServerBridge({
@@ -220,12 +223,30 @@ export class FrameServerPool {
   }
 
   /**
-   * Check if a source path is loaded.
+   * Check if a source path has an open bridge.
    * @param {string} sourcePath
    * @returns {boolean}
    */
   has(sourcePath) {
     return this._bridges.has(sourcePath);
+  }
+
+  /**
+   * Return the pre-opened bridge for a source path, or null.
+   * @param {string} sourcePath
+   * @returns {FrameServerBridge|null}
+   */
+  get(sourcePath) {
+    return this._bridges.get(sourcePath) ?? null;
+  }
+
+  /**
+   * Return the registered File object for a source path, or null.
+   * @param {string} sourcePath
+   * @returns {File|null}
+   */
+  getFile(sourcePath) {
+    return this._files.get(sourcePath) ?? null;
   }
 
   /**
@@ -247,5 +268,6 @@ export class FrameServerPool {
   destroy() {
     for (const bridge of this._bridges.values()) bridge.destroy();
     this._bridges.clear();
+    this._files.clear();
   }
 }

@@ -277,10 +277,18 @@ requestAnimationFrame(() => {
 document.getElementById('btn-save-project')?.addEventListener('click', saveProject);
 document.getElementById('btn-load-project')?.addEventListener('click', loadProject);
 
-// Re-render timeline when a project is loaded
+// Re-render timeline when a project is loaded.
+// Only re-decode the current frame if the pool has the source file for the
+// clip at the current playhead position — otherwise decodeFrameAt returns
+// null and the frame-state callback would incorrectly show the overlay.
 window.addEventListener('nle:project-loaded', () => {
   _timeline?.render();
-  playback?.syncPlayheadPts(playback.playheadPts);
+  if (playback) {
+    const resolved = _engine?.resolve_frame?.(_seqId, playback.playheadPts);
+    if (!resolved || pool.has(resolved.source_path)) {
+      playback.syncPlayheadPts(playback.playheadPts);
+    }
+  }
 });
 
 // ── Second vertical divider sync ───────────────────────────────────────────

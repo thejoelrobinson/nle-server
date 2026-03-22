@@ -108,6 +108,23 @@ async function restoreAutosave() {
     const db   = await _openDb();
     const data = await _idbGet(db, STORE_NAME, AUTOSAVE_KEY);
     if (!data) return;
+
+    // Only restore the sequence if every referenced source file is already
+    // in the pool.  At cold startup the pool is always empty, so this guard
+    // prevents stale clips (from a previous session) from being loaded into
+    // the engine without their decode bridges — which would cause
+    // FrameServerPool.decodeFrameAt() to return null and the program monitor
+    // to show the "No sequence" overlay even after a fresh import.
+    const { pool } = window._nle ?? {};
+    if (pool) {
+      const seq    = data.sequence ?? {};
+      const tracks = [...(seq.video_tracks ?? []), ...(seq.audio_tracks ?? [])];
+      const hasUnloaded = tracks.some((t) =>
+        (t.clips ?? []).some((c) => c.source_path && !pool.has(c.source_path)),
+      );
+      if (hasUnloaded) return;
+    }
+
     _applySequence(data.sequence);
   } catch { /* no autosave */ }
 }
