@@ -1,6 +1,7 @@
 #include "frame_server.h"
 #include <cstring>
 #include <cstdio>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // AVIO callbacks – let libavformat read from our in-memory buffer
@@ -48,6 +49,8 @@ FrameServer::~FrameServer() {
 }
 
 void FrameServer::cleanup() {
+    if (_swr_ctx)          { swr_free(&_swr_ctx); _swr_ctx = nullptr; }
+    if (_audio_codec_ctx)  { avcodec_free_context(&_audio_codec_ctx); _audio_codec_ctx = nullptr; }
     if (sws_ctx_) { sws_freeContext(sws_ctx_); sws_ctx_ = nullptr; }
     if (yuv_frame_) { av_frame_free(&yuv_frame_); }
     if (frame_)     { av_frame_free(&frame_); }
@@ -59,7 +62,8 @@ void FrameServer::cleanup() {
         avio_context_free(&avio_ctx_);
     }
     avio_buf_ = nullptr;
-    video_stream_idx_ = -1;
+    video_stream_idx_   = -1;
+    _audio_stream_index = -1;
     width_ = height_ = 0;
     file_buf_.clear();
 }
@@ -179,6 +183,31 @@ bool FrameServer::init_decoder() {
         if (!sws_ctx_) {
             fprintf(stderr, "FrameServer: sws_getContext failed\n");
             return false;
+        }
+    }
+
+    // Find and open audio stream (non-fatal if absent)
+    _audio_stream_index = -1;
+    for (unsigned i = 0; i < fmt_ctx_->nb_streams; i++) {
+        if (fmt_ctx_->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            _audio_stream_index = static_cast<int>(i);
+            break;
+        }
+    }
+    if (_audio_stream_index >= 0) {
+        AVCodecParameters* aparams = fmt_ctx_->streams[_audio_stream_index]->codecpar;
+        const AVCodec* acodec = avcodec_find_decoder(aparams->codec_id);
+        if (acodec) {
+            _audio_codec_ctx = avcodec_alloc_context3(acodec);
+            avcodec_parameters_to_context(_audio_codec_ctx, aparams);
+            _audio_codec_ctx->thread_count = 1;
+            if (avcodec_open2(_audio_codec_ctx, acodec, nullptr) < 0) {
+                avcodec_free_context(&_audio_codec_ctx);
+                _audio_codec_ctx = nullptr;
+                _audio_stream_index = -1;
+            }
+        } else {
+            _audio_stream_index = -1;
         }
     }
 
@@ -378,6 +407,94 @@ emscripten::val FrameServer::_frame_to_result(double pts_sec) {
     return result;
 }
 
+// ---------------------------------------------------------------------------
+// Audio API
+// ---------------------------------------------------------------------------
+
+bool FrameServer::has_audio() {
+    return _audio_stream_index >= 0 && _audio_codec_ctx != nullptr;
+}
+
+emscripten::val FrameServer::decode_audio_at(double target_seconds, int num_samples) {
+    if (!has_audio()) return emscripten::val::null();
+
+    // Seek
+    int64_t seek_ts = static_cast<int64_t>(target_seconds * AV_TIME_BASE);
+    av_seek_frame(fmt_ctx_, -1, seek_ts, AVSEEK_FLAG_BACKWARD);
+    avcodec_flush_buffers(_audio_codec_ctx);
+
+    // Init swr on first call (or after codec change)
+    if (!_swr_ctx) {
+        _swr_ctx = swr_alloc();
+#if LIBAVUTIL_VERSION_MAJOR >= 57
+        // FFmpeg 5+: new channel layout API
+        AVChannelLayout in_layout  = _audio_codec_ctx->ch_layout;
+        AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
+        av_opt_set_chlayout(_swr_ctx, "in_chlayout",  &in_layout,  0);
+        av_opt_set_chlayout(_swr_ctx, "out_chlayout", &out_layout, 0);
+#else
+        int64_t in_layout = _audio_codec_ctx->channel_layout
+            ? _audio_codec_ctx->channel_layout
+            : av_get_default_channel_layout(_audio_codec_ctx->channels);
+        av_opt_set_int(_swr_ctx, "in_channel_layout",  in_layout,            0);
+        av_opt_set_int(_swr_ctx, "out_channel_layout", AV_CH_LAYOUT_STEREO,  0);
+#endif
+        av_opt_set_int(_swr_ctx, "in_sample_rate",  _audio_codec_ctx->sample_rate, 0);
+        av_opt_set_int(_swr_ctx, "out_sample_rate", 48000,                         0);
+        av_opt_set_sample_fmt(_swr_ctx, "in_sample_fmt",  _audio_codec_ctx->sample_fmt, 0);
+        av_opt_set_sample_fmt(_swr_ctx, "out_sample_fmt", AV_SAMPLE_FMT_FLT,            0);
+        if (swr_init(_swr_ctx) < 0) {
+            swr_free(&_swr_ctx);
+            return emscripten::val::null();
+        }
+    }
+
+    std::vector<float> output;
+    output.reserve(static_cast<size_t>(num_samples) * 2);
+
+    AVPacket* pkt   = av_packet_alloc();
+    AVFrame*  frame = av_frame_alloc();
+    int collected = 0;
+
+    while (collected < num_samples * 2 && av_read_frame(fmt_ctx_, pkt) >= 0) {
+        if (pkt->stream_index != _audio_stream_index) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        if (avcodec_send_packet(_audio_codec_ctx, pkt) < 0) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        av_packet_unref(pkt);
+
+        while (avcodec_receive_frame(_audio_codec_ctx, frame) == 0) {
+            int out_samples = static_cast<int>(av_rescale_rnd(
+                swr_get_delay(_swr_ctx, _audio_codec_ctx->sample_rate) + frame->nb_samples,
+                48000, _audio_codec_ctx->sample_rate, AV_ROUND_UP));
+
+            std::vector<float> buf(static_cast<size_t>(out_samples) * 2);
+            uint8_t* out_ptr = reinterpret_cast<uint8_t*>(buf.data());
+            int converted = swr_convert(_swr_ctx, &out_ptr, out_samples,
+                                        const_cast<const uint8_t**>(frame->extended_data),
+                                        frame->nb_samples);
+            if (converted > 0) {
+                output.insert(output.end(), buf.begin(), buf.begin() + converted * 2);
+                collected += converted * 2;
+            }
+            av_frame_unref(frame);
+        }
+    }
+
+    av_packet_free(&pkt);
+    av_frame_free(&frame);
+
+    if (output.empty()) return emscripten::val::null();
+
+    auto result = emscripten::val::global("Float32Array").new_(output.size());
+    for (size_t i = 0; i < output.size(); i++) result.set(i, output[i]);
+    return result;
+}
+
 emscripten::val FrameServer::get_stream_info() {
     if (!fmt_ctx_ || video_stream_idx_ < 0 || !codec_ctx_) return emscripten::val::null();
     AVStream* s = fmt_ctx_->streams[video_stream_idx_];
@@ -392,6 +509,7 @@ emscripten::val FrameServer::get_stream_info() {
     info.set("color_trc",      emscripten::val((int)codec_ctx_->color_trc));
     info.set("colorspace",     emscripten::val((int)codec_ctx_->colorspace));
     info.set("codec_id",       emscripten::val((int)codec_ctx_->codec_id));
+    info.set("has_audio",      emscripten::val(has_audio()));
     return info;
 }
 

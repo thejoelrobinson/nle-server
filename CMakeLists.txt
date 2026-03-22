@@ -38,6 +38,7 @@ target_link_libraries(frame_server PRIVATE
     ${FFMPEG_LIB_DIR}/libavformat.a
     ${FFMPEG_LIB_DIR}/libavcodec.a
     ${FFMPEG_LIB_DIR}/libswscale.a
+    ${FFMPEG_LIB_DIR}/libswresample.a
     ${FFMPEG_LIB_DIR}/libavutil.a
 )
 
@@ -45,6 +46,7 @@ target_link_libraries(frame_server PRIVATE
 set(EM_LINK_FLAGS
     "-s WASM=1"
     "-s ALLOW_MEMORY_GROWTH=1"
+    "-s INITIAL_MEMORY=32MB"
     "-s MAXIMUM_MEMORY=4GB"
     "-s USE_PTHREADS=0"            # Phase 1: single-threaded
     "-s EXPORT_ES6=1"

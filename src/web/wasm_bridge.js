@@ -183,6 +183,23 @@ export class FrameServerBridge {
     return this._server.get_stream_info();
   }
 
+  /** @returns {boolean} */
+  hasAudio() {
+    return this._server ? this._server.has_audio() : false;
+  }
+
+  /**
+   * Decode ~numSamples stereo float32 samples starting at targetSecs.
+   * Returns a Float32Array (interleaved L/R), or null if no audio.
+   * @param {number} targetSecs
+   * @param {number} [numSamples=8192]
+   * @returns {Float32Array|null}
+   */
+  decodeAudioAt(targetSecs, numSamples = 8192) {
+    if (!this._server) return null;
+    return this._server.decode_audio_at(targetSecs, numSamples) || null;
+  }
+
   get currentPts() { return this._pts; }
   get duration()   { return this._duration; }
   get fps()        { return this._fps; }
@@ -260,6 +277,19 @@ export class FrameServerPool {
     const bridge = this._bridges.get(sourcePath);
     if (!bridge) return null;
     return bridge.decodeFrameAt(seconds);
+  }
+
+  /**
+   * Decode audio samples from a loaded source at targetSecs.
+   * @param {string} sourcePath
+   * @param {number} targetSecs
+   * @param {number} [numSamples=8192]
+   * @returns {Float32Array|null}
+   */
+  decodeAudioAt(sourcePath, targetSecs, numSamples = 8192) {
+    const bridge = this._bridges.get(sourcePath);
+    if (!bridge) return null;
+    return bridge.decodeAudioAt(targetSecs, numSamples);
   }
 
   /**
