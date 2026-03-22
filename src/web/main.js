@@ -18,6 +18,7 @@ import { Timeline }                            from './timeline.js';
 import { Playback }                            from './playback.js';
 import { initMediaBin }                        from './media_bin.js';
 import { initProject, saveProject, loadProject } from './project.js';
+import { showExportDialog } from './export_ui.js';
 
 // ── Init layout (draggable dividers) ──────────────────────────────────────
 initLayout();
@@ -270,9 +271,13 @@ requestAnimationFrame(() => {
   initProject();
 });
 
-// Save / Load project buttons
+// Save / Load / Export buttons
 document.getElementById('btn-save-project')?.addEventListener('click', saveProject);
 document.getElementById('btn-load-project')?.addEventListener('click', loadProject);
+document.getElementById('btn-export')?.addEventListener('click', () => {
+  _getOrCreateEngineAndSeq();
+  showExportDialog(_engine, pool, _seqId);
+});
 
 // Re-render timeline when a project is loaded
 window.addEventListener('nle:project-loaded', () => {
