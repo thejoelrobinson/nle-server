@@ -20,7 +20,7 @@
 const WASM_JS_URL = '/wasm/frame_server.js';
 
 export class FrameServerBridge {
-  constructor({ onFrame, onEnd, onError, onMetadata }) {
+  constructor({ onFrame, onEnd, onError, onMetadata } = {}) {
     this._mod    = null;   // Emscripten module instance
     this._server = null;   // FrameServer C++ object (Embind wrapper)
 
@@ -31,11 +31,11 @@ export class FrameServerBridge {
     this._width    = 0;
     this._height   = 0;
 
-    // Callbacks
-    this._onFrame    = onFrame;    // (frame, pts) => void
-    this._onEnd      = onEnd;      // () => void
-    this._onError    = onError;    // (msg) => void
-    this._onMetadata = onMetadata; // ({width,height,fps,duration,frameCount}) => void
+    // Callbacks (all optional — default to noops)
+    this._onFrame    = onFrame    ?? (() => {});
+    this._onEnd      = onEnd      ?? (() => {});
+    this._onError    = onError    ?? (() => {});
+    this._onMetadata = onMetadata ?? (() => {});
 
     this._loadPromise = this._loadWasm();
   }
@@ -183,6 +183,23 @@ export class FrameServerBridge {
     return this._server.get_stream_info();
   }
 
+  /**
+   * Generate an MJPEG proxy for the open file.
+   * Blocks the main thread until complete; progressCb is called synchronously
+   * from within C++ with (currentFrame, totalFrames).
+   * @param {number} targetWidth
+   * @param {number} targetHeight
+   * @param {function} [progressCb]
+   * @returns {Uint8Array|null}
+   */
+  async generateProxy(targetWidth, targetHeight, progressCb) {
+    if (!this._server) return null;
+    if (progressCb) {
+      this._server.set_proxy_progress_callback(progressCb);
+    }
+    return this._server.generate_proxy(targetWidth, targetHeight);
+  }
+
   get currentPts() { return this._pts; }
   get duration()   { return this._duration; }
   get fps()        { return this._fps; }
@@ -196,40 +213,175 @@ export class FrameServerBridge {
 
 // ── FrameServerPool ───────────────────────────────────────────────────────
 //
-// Maintains a cache of source_path → FrameServerBridge so the Program Monitor
+// Maintains a cache of source_path → pool entry so the Program Monitor
 // can decode any clip frame without re-opening the file on every seek.
+// For long-GOP sources (H.264, HEVC, MPEG-2 …) a background proxy is
+// generated at import time and stored in IndexedDB; subsequent imports of
+// the same file load the proxy instantly.
 //
-// Usage:
-//   const pool = new FrameServerPool();
-//   await pool.addFile(file);                    // adds by file.name as key
-//   const frame = pool.decodeFrameAt(path, sec); // null if path not loaded
+// Pool entry shape:  { bridge, proxyBridge, file, info, proxyHash }
 
 export class FrameServerPool {
   constructor() {
-    this._bridges = new Map();  // source_path → FrameServerBridge
-    this._infos   = new Map();  // source_path → stream info object
+    this._pool          = new Map();  // source_path → entry
+    this._onProxyProgress = null;
   }
+
+  // ── Long-GOP detection ────────────────────────────────────────────────────
+
+  /**
+   * Returns true if the codec produces long-GOP video that benefits from
+   * a proxy.  Codec IDs are from the FFmpeg AVCodecID enum.
+   * H264=27, HEVC=173, MPEG2VIDEO=4, MPEG4=13, MPEG1VIDEO=1
+   */
+  static isLongGOP(codecId) {
+    return [27, 173, 4, 13, 1].includes(codecId);
+  }
+
+  // ── File hashing for proxy cache key ─────────────────────────────────────
+
+  /** SHA-256 of first 64 KB of file, returned as hex string. */
+  static async hashFile(file) {
+    const slice = file.slice(0, 65536);
+    const buf   = await slice.arrayBuffer();
+    const hash  = await crypto.subtle.digest('SHA-256', buf);
+    return Array.from(new Uint8Array(hash))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+
+  // ── IndexedDB helpers ─────────────────────────────────────────────────────
+
+  static async _openProxyDB() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open('nle-proxies', 1);
+      req.onupgradeneeded = (e) => e.target.result.createObjectStore('proxies');
+      req.onsuccess       = (e) => resolve(e.target.result);
+      req.onerror         = reject;
+    });
+  }
+
+  static async _loadProxy(hash) {
+    const db = await FrameServerPool._openProxyDB();
+    return new Promise((resolve) => {
+      const tx  = db.transaction('proxies', 'readonly');
+      const req = tx.objectStore('proxies').get(hash);
+      req.onsuccess = (e) => resolve(e.target.result ?? null);
+      req.onerror   = () => resolve(null);
+    });
+  }
+
+  static async _storeProxy(hash, blob) {
+    const db = await FrameServerPool._openProxyDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('proxies', 'readwrite');
+      tx.objectStore('proxies').put(blob, hash);
+      tx.oncomplete = resolve;
+      tx.onerror    = reject;
+    });
+  }
+
+  // ── Public API ────────────────────────────────────────────────────────────
 
   /**
    * Open a File and add it to the pool, keyed by file.name.
+   * For long-GOP sources: checks IndexedDB for a cached proxy, then either
+   * loads it immediately or queues background generation.
    * No-op if already loaded.
    * @param {File} file
    */
   async addFile(file) {
-    if (this._bridges.has(file.name)) return;
+    if (this._pool.has(file.name)) return;
 
-    const bridge = new FrameServerBridge({
-      onFrame:    () => {},
-      onEnd:      () => {},
-      onError:    () => {},
-      onMetadata: () => {},
-    });
-
+    const bridge = new FrameServerBridge();
     await bridge.ready();
     await bridge.openFile(file);
-    this._bridges.set(file.name, bridge);
-    this._infos.set(file.name, bridge.getStreamInfo());
+
+    const info = bridge.getStreamInfo();
+    const entry = { bridge, proxyBridge: null, file, info, proxyHash: null };
+    this._pool.set(file.name, entry);
+
+    if (info && FrameServerPool.isLongGOP(info.codec_id)) {
+      const hash = await FrameServerPool.hashFile(file);
+      entry.proxyHash = hash;
+
+      const proxyBlob = await FrameServerPool._loadProxy(hash);
+      if (proxyBlob) {
+        // Proxy already in cache — open it immediately
+        try {
+          const proxyBridge = new FrameServerBridge();
+          await proxyBridge.ready();
+          await proxyBridge.openFile(
+            new File([proxyBlob], 'proxy.mjpeg', { type: 'video/x-mjpeg' })
+          );
+          entry.proxyBridge = proxyBridge;
+        } catch (err) {
+          console.warn('[FrameServerPool] Failed to open cached proxy:', err); // eslint-disable-line no-console
+        }
+      } else {
+        // Generate proxy in the background
+        this._generateProxyBackground(file.name);
+      }
+    }
   }
+
+  /**
+   * Background proxy generation for a long-GOP source.
+   * Scales to at most 960 px wide, preserving aspect ratio.
+   * @param {string} path  key in this._pool
+   */
+  async _generateProxyBackground(path) {
+    const entry = this._pool.get(path);
+    if (!entry) return;
+
+    const { info } = entry;
+    const scale  = Math.min(1, 960 / info.width);
+    const proxyW = Math.round(info.width  * scale / 2) * 2;
+    const proxyH = Math.round(info.height * scale / 2) * 2;
+
+    this._onProxyProgress?.(path, 0, 1);
+
+    let proxyData;
+    try {
+      proxyData = await entry.bridge.generateProxy(proxyW, proxyH, (cur, total) => {
+        this._onProxyProgress?.(path, cur, total);
+      });
+    } catch (err) {
+      console.warn('[FrameServerPool] Proxy generation error:', err); // eslint-disable-line no-console
+      return;
+    }
+
+    if (!proxyData || proxyData.length === 0) return;
+
+    const proxyBlob = new Blob([proxyData], { type: 'video/x-mjpeg' });
+
+    try {
+      await FrameServerPool._storeProxy(entry.proxyHash, proxyBlob);
+    } catch (err) {
+      console.warn('[FrameServerPool] Failed to store proxy in IndexedDB:', err); // eslint-disable-line no-console
+    }
+
+    // Open the proxy bridge
+    try {
+      const proxyBridge = new FrameServerBridge();
+      await proxyBridge.ready();
+      await proxyBridge.openFile(
+        new File([proxyBlob], 'proxy.mjpeg', { type: 'video/x-mjpeg' })
+      );
+      entry.proxyBridge = proxyBridge;
+    } catch (err) {
+      console.warn('[FrameServerPool] Failed to open generated proxy:', err); // eslint-disable-line no-console
+      return;
+    }
+
+    this._onProxyProgress?.(path, 1, 1);
+  }
+
+  /**
+   * Setter for the proxy-progress callback.
+   * Called with (path, currentFrame, totalFrames).
+   */
+  set onProxyProgress(cb) { this._onProxyProgress = cb; }
 
   /**
    * Return stored stream info for a loaded source path.
@@ -237,7 +389,7 @@ export class FrameServerPool {
    * @returns {object|null}
    */
   getInfo(sourcePath) {
-    return this._infos.get(sourcePath) ?? null;
+    return this._pool.get(sourcePath)?.info ?? null;
   }
 
   /**
@@ -246,28 +398,42 @@ export class FrameServerPool {
    * @returns {boolean}
    */
   has(sourcePath) {
-    return this._bridges.has(sourcePath);
+    return this._pool.has(sourcePath);
   }
 
   /**
    * Decode the frame at `seconds` from the given source.
+   * Uses the proxy bridge when available (and useProxy is true).
    * Returns the YUV frame object, or null if source is not loaded.
    * @param {string} sourcePath
    * @param {number} seconds
+   * @param {boolean} [useProxy=true]
    * @returns {object|null}
    */
-  decodeFrameAt(sourcePath, seconds) {
-    const bridge = this._bridges.get(sourcePath);
-    if (!bridge) return null;
+  decodeFrameAt(sourcePath, seconds, useProxy = true) {
+    const entry = this._pool.get(sourcePath);
+    if (!entry) return null;
+    const bridge = (useProxy && entry.proxyBridge) ? entry.proxyBridge : entry.bridge;
     return bridge.decodeFrameAt(seconds);
+  }
+
+  /**
+   * Get the FrameServerBridge for a loaded source (for reading metadata).
+   * @param {string} sourcePath
+   * @returns {FrameServerBridge|null}
+   */
+  getBridge(sourcePath) {
+    return this._pool.get(sourcePath)?.bridge ?? null;
   }
 
   /**
    * Remove all bridges from the pool.
    */
   destroy() {
-    for (const bridge of this._bridges.values()) bridge.destroy();
-    this._bridges.clear();
-    this._infos.clear();
+    for (const entry of this._pool.values()) {
+      entry.bridge?.destroy();
+      entry.proxyBridge?.destroy();
+    }
+    this._pool.clear();
   }
 }

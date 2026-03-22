@@ -98,6 +98,8 @@ emconfigure ./configure \
     --enable-decoder=mjpeg \
     --enable-decoder=png \
     \
+    --enable-encoder=mjpeg \
+    \
     --enable-demuxer=mov \
     --enable-demuxer=matroska \
     --enable-demuxer=mp4 \
@@ -105,6 +107,9 @@ emconfigure ./configure \
     --enable-demuxer=mpegts \
     --enable-demuxer=mxf \
     --enable-demuxer=image2 \
+    --enable-demuxer=mjpeg \
+    \
+    --enable-muxer=mjpeg \
     \
     --enable-protocol=file \
     \

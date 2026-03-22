@@ -20,9 +20,11 @@ EMSCRIPTEN_BINDINGS(nle_frame_server) {
         .function("get_frame_count",  &FrameServer::get_frame_count)
         .function("seek",             &FrameServer::seek)
         .function("decode_next_frame",&FrameServer::decode_next_frame)
-        .function("decode_frame_at",  &FrameServer::decode_frame_at)
-        .function("get_stream_info",  &FrameServer::get_stream_info)
-        .function("close",            &FrameServer::close)
+        .function("decode_frame_at",             &FrameServer::decode_frame_at)
+        .function("get_stream_info",             &FrameServer::get_stream_info)
+        .function("generate_proxy",              &FrameServer::generate_proxy)
+        .function("set_proxy_progress_callback", &FrameServer::set_proxy_progress_callback)
+        .function("close",                       &FrameServer::close)
         ;
 }
 

@@ -45,6 +45,20 @@ public:
      */
     emscripten::val decode_frame_at(double target_seconds);
 
+    /**
+     * Generate an MJPEG proxy file for the currently open video.
+     * Every frame is encoded as a JPEG keyframe, enabling O(1) per-frame seek.
+     * target_width / target_height must be even numbers.
+     * Returns the proxy bytes as a JS Uint8Array, or null on failure.
+     */
+    emscripten::val generate_proxy(int target_width, int target_height);
+
+    /**
+     * Register a JS callback invoked during proxy generation with
+     * (current_frame: number, total_frames: number).
+     */
+    void set_proxy_progress_callback(emscripten::val cb);
+
     void close();
 
 private:
@@ -73,4 +87,7 @@ private:
     int video_stream_idx_ = -1;
     int width_  = 0;
     int height_ = 0;
+
+    // Proxy generation
+    emscripten::val _proxy_progress_cb_ = emscripten::val::undefined();
 };

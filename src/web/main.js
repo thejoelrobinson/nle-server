@@ -153,7 +153,7 @@ async function importFileToTimeline(file, trackIndex = 0, srcInPts = 0, srcOutPt
   }
 
   // Determine source duration from the bridge
-  const bridge = pool._bridges.get(file.name);
+  const bridge = pool.getBridge(file.name);
   const dur    = bridge?.duration ?? 10;
   const fps    = bridge?.fps      ?? 24;
 

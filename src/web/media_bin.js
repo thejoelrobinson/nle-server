@@ -150,12 +150,14 @@ export function initMediaBin() {
     clips.forEach((clip, idx) => {
       const item = document.createElement('div');
       item.className = 'bin-item' + (idx === activeIdx ? ' selected' : '');
-      item.dataset.idx = idx;
+      item.dataset.idx  = idx;
+      item.dataset.path = clip.file.name;
       item.innerHTML = `
         <div class="bin-item-icon">▶</div>
         <div class="bin-item-info">
           <div class="bin-item-name" title="${_esc(clip.file.name)}">${_esc(clip.file.name)}</div>
           <div class="bin-item-meta">${formatTimecode(clip.duration, clip.fps)}  ${clip.fps.toFixed(2)} fps  ${clip.width}×${clip.height}</div>
+          <div class="proxy-status"></div>
         </div>`;
       item.addEventListener('click',    () => openInSource(idx));
       item.addEventListener('dblclick', () => openInSource(idx));
@@ -168,11 +170,21 @@ export function initMediaBin() {
   async function importFiles(fileList) {
     const { pool } = window._nle ?? {};
     if (!pool) return;
+
+    // Wire up proxy progress display once (idempotent)
+    pool.onProxyProgress = (path, cur, total) => {
+      const pct = total > 0 ? Math.round((cur / total) * 100) : 0;
+      const el  = document.querySelector(
+        `[data-path="${CSS.escape(path)}"] .proxy-status`
+      );
+      if (el) el.textContent = cur >= total ? '✓ proxy' : `proxy ${pct}%`;
+    };
+
     for (const file of fileList) {
       if (clips.some((c) => c.file.name === file.name)) continue;
       try {
         await pool.addFile(file);
-        const bridge = pool._bridges.get(file.name);
+        const bridge = pool.getBridge(file.name);
         clips.push({
           file,
           duration: bridge?.duration ?? 0,

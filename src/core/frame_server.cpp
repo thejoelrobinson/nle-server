@@ -398,3 +398,202 @@ emscripten::val FrameServer::get_stream_info() {
 void FrameServer::close() {
     cleanup();
 }
+
+// ---------------------------------------------------------------------------
+// generate_proxy  –  encode every frame as MJPEG to a dynamic memory buffer
+// ---------------------------------------------------------------------------
+
+void FrameServer::set_proxy_progress_callback(emscripten::val cb) {
+    _proxy_progress_cb_ = cb;
+}
+
+emscripten::val FrameServer::generate_proxy(int target_width, int target_height) {
+    if (!fmt_ctx_ || video_stream_idx_ < 0 || !codec_ctx_) return emscripten::val::null();
+    if (target_width <= 0 || target_height <= 0)            return emscripten::val::null();
+
+    // ── 1. Seek back to the start ─────────────────────────────────────────
+    av_seek_frame(fmt_ctx_, video_stream_idx_, 0, AVSEEK_FLAG_BACKWARD);
+    avcodec_flush_buffers(codec_ctx_);
+
+    // ── 2. Find MJPEG encoder ─────────────────────────────────────────────
+    const AVCodec* enc = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
+    if (!enc) {
+        fprintf(stderr, "FrameServer::generate_proxy: MJPEG encoder not available\n");
+        return emscripten::val::null();
+    }
+
+    // ── 3. Configure encoder context ─────────────────────────────────────
+    AVCodecContext* enc_ctx = avcodec_alloc_context3(enc);
+    if (!enc_ctx) return emscripten::val::null();
+
+    AVStream* src_stream = fmt_ctx_->streams[video_stream_idx_];
+    AVRational src_fps   = src_stream->r_frame_rate;
+    if (src_fps.num <= 0 || src_fps.den <= 0) { src_fps = {24, 1}; }
+
+    enc_ctx->width          = target_width;
+    enc_ctx->height         = target_height;
+    enc_ctx->pix_fmt        = AV_PIX_FMT_YUVJ420P;
+    enc_ctx->time_base      = { src_fps.den, src_fps.num };  // 1/fps
+    enc_ctx->global_quality = FF_QP2LAMBDA * 4;
+    enc_ctx->flags         |= AV_CODEC_FLAG_QSCALE;
+
+    if (avcodec_open2(enc_ctx, enc, nullptr) < 0) {
+        fprintf(stderr, "FrameServer::generate_proxy: avcodec_open2 (MJPEG) failed\n");
+        avcodec_free_context(&enc_ctx);
+        return emscripten::val::null();
+    }
+
+    // ── 4. Set up output AVFormatContext writing to a dynamic buffer ──────
+    AVFormatContext* out_ctx = nullptr;
+    if (avformat_alloc_output_context2(&out_ctx, nullptr, "mjpeg", nullptr) < 0 || !out_ctx) {
+        fprintf(stderr, "FrameServer::generate_proxy: avformat_alloc_output_context2 failed\n");
+        avcodec_free_context(&enc_ctx);
+        return emscripten::val::null();
+    }
+
+    if (avio_open_dyn_buf(&out_ctx->pb) < 0) {
+        fprintf(stderr, "FrameServer::generate_proxy: avio_open_dyn_buf failed\n");
+        avformat_free_context(out_ctx);
+        avcodec_free_context(&enc_ctx);
+        return emscripten::val::null();
+    }
+
+    AVStream* out_stream = avformat_new_stream(out_ctx, enc);
+    if (!out_stream) {
+        uint8_t* tmp = nullptr; avio_close_dyn_buf(out_ctx->pb, &tmp); av_free(tmp);
+        avformat_free_context(out_ctx);
+        avcodec_free_context(&enc_ctx);
+        return emscripten::val::null();
+    }
+
+    avcodec_parameters_from_context(out_stream->codecpar, enc_ctx);
+    out_stream->time_base = enc_ctx->time_base;
+
+    if (avformat_write_header(out_ctx, nullptr) < 0) {
+        fprintf(stderr, "FrameServer::generate_proxy: avformat_write_header failed\n");
+        uint8_t* tmp = nullptr; avio_close_dyn_buf(out_ctx->pb, &tmp); av_free(tmp);
+        avformat_free_context(out_ctx);
+        avcodec_free_context(&enc_ctx);
+        return emscripten::val::null();
+    }
+
+    // ── 5. Allocate scaled output frame ───────────────────────────────────
+    AVFrame* scaled = av_frame_alloc();
+    if (!scaled) {
+        uint8_t* tmp = nullptr; avio_close_dyn_buf(out_ctx->pb, &tmp); av_free(tmp);
+        avformat_free_context(out_ctx);
+        avcodec_free_context(&enc_ctx);
+        return emscripten::val::null();
+    }
+    scaled->format = AV_PIX_FMT_YUVJ420P;
+    scaled->width  = target_width;
+    scaled->height = target_height;
+    av_frame_get_buffer(scaled, 0);
+
+    AVPacket* enc_pkt   = av_packet_alloc();
+    SwsContext* prx_sws = nullptr;    // created on first decoded frame
+    int total_frames    = get_frame_count();
+    int current_frame   = 0;
+    bool have_error     = false;
+
+    // ── 6. Decode every frame, scale, encode ─────────────────────────────
+    auto flush_encoder = [&]() {
+        avcodec_send_frame(enc_ctx, nullptr);
+        while (true) {
+            int r = avcodec_receive_packet(enc_ctx, enc_pkt);
+            if (r == AVERROR_EOF || r == AVERROR(EAGAIN)) break;
+            if (r < 0) break;
+            enc_pkt->stream_index = 0;
+            av_write_frame(out_ctx, enc_pkt);
+            av_packet_unref(enc_pkt);
+        }
+    };
+
+    while (!have_error) {
+        int ret = av_read_frame(fmt_ctx_, packet_);
+        if (ret == AVERROR_EOF) {
+            avcodec_send_packet(codec_ctx_, nullptr);
+        } else if (ret < 0) {
+            break;
+        } else if (packet_->stream_index != video_stream_idx_) {
+            av_packet_unref(packet_);
+            continue;
+        } else {
+            ret = avcodec_send_packet(codec_ctx_, packet_);
+            av_packet_unref(packet_);
+            if (ret < 0 && ret != AVERROR(EAGAIN)) break;
+        }
+
+        while (true) {
+            ret = avcodec_receive_frame(codec_ctx_, frame_);
+            if (ret == AVERROR(EAGAIN)) break;
+            if (ret == AVERROR_EOF)     { goto proxy_done; }
+            if (ret < 0)               { have_error = true; break; }
+
+            // Create scaler on first frame (pixel format is then known)
+            if (!prx_sws) {
+                prx_sws = sws_getContext(
+                    frame_->width, frame_->height, (AVPixelFormat)frame_->format,
+                    target_width, target_height, AV_PIX_FMT_YUVJ420P,
+                    SWS_BILINEAR, nullptr, nullptr, nullptr
+                );
+                if (!prx_sws) { av_frame_unref(frame_); have_error = true; break; }
+            }
+
+            sws_scale(prx_sws,
+                      frame_->data, frame_->linesize, 0, frame_->height,
+                      scaled->data, scaled->linesize);
+            av_frame_unref(frame_);
+
+            scaled->pts = current_frame;
+            if (avcodec_send_frame(enc_ctx, scaled) == 0) {
+                while (avcodec_receive_packet(enc_ctx, enc_pkt) == 0) {
+                    enc_pkt->stream_index = 0;
+                    av_write_frame(out_ctx, enc_pkt);
+                    av_packet_unref(enc_pkt);
+                }
+            }
+            ++current_frame;
+
+            // Fire progress callback if registered
+            if (_proxy_progress_cb_.typeOf().as<std::string>() == "function") {
+                _proxy_progress_cb_(current_frame, total_frames);
+            }
+        }
+
+        if (ret == AVERROR_EOF) break;
+    }
+
+proxy_done:
+    flush_encoder();
+    av_write_trailer(out_ctx);
+
+    // ── 7. Collect buffer ─────────────────────────────────────────────────
+    uint8_t* buf      = nullptr;
+    int      buf_size = avio_close_dyn_buf(out_ctx->pb, &buf);
+    out_ctx->pb = nullptr;
+
+    // ── 8. Cleanup encoder / format resources ────────────────────────────
+    if (prx_sws)    sws_freeContext(prx_sws);
+    av_frame_free(&scaled);
+    av_packet_free(&enc_pkt);
+    avformat_free_context(out_ctx);
+    avcodec_free_context(&enc_ctx);
+
+    // Restore decoder to a clean state (seek back to 0)
+    av_seek_frame(fmt_ctx_, video_stream_idx_, 0, AVSEEK_FLAG_BACKWARD);
+    avcodec_flush_buffers(codec_ctx_);
+
+    if (!buf || buf_size <= 0) {
+        av_free(buf);
+        return emscripten::val::null();
+    }
+
+    // ── 9. Return a JS Uint8Array (copied so buf can be freed) ───────────
+    emscripten::val result = emscripten::val::global("Uint8Array").new_(buf_size);
+    emscripten::val view   = emscripten::val(emscripten::typed_memory_view(
+        static_cast<size_t>(buf_size), buf));
+    result.call<void>("set", view);
+    av_free(buf);
+    return result;
+}
