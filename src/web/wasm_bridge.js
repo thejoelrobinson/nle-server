@@ -24,18 +24,15 @@ export class FrameServerBridge {
     this._mod    = null;   // Emscripten module instance
     this._server = null;   // FrameServer C++ object (Embind wrapper)
 
-    // Playback state
-    this._playing    = false;
-    this._rafId      = null;
-    this._lastWallMs = null;   // wall-clock time of previous rAF tick
-    this._pts        = 0;      // current playback time in seconds
-    this._fps        = 0;
-    this._duration   = 0;
-    this._width      = 0;
-    this._height     = 0;
+    // Decode state
+    this._pts      = 0;    // current decode position in seconds
+    this._fps      = 0;
+    this._duration = 0;
+    this._width    = 0;
+    this._height   = 0;
 
     // Callbacks
-    this._onFrame    = onFrame;    // (rgba, width, height, pts) => void
+    this._onFrame    = onFrame;    // (frame, pts) => void
     this._onEnd      = onEnd;      // () => void
     this._onError    = onError;    // (msg) => void
     this._onMetadata = onMetadata; // ({width,height,fps,duration,frameCount}) => void
@@ -110,7 +107,6 @@ export class FrameServerBridge {
    */
   async openFile(file) {
     await this.ready();
-    this.pause();
     if (this._server) { this._server.close(); this._server.delete(); this._server = null; }
 
     // Read file into a Uint8Array and pass it directly to the C++ open() via
@@ -150,21 +146,6 @@ export class FrameServerBridge {
     });
   }
 
-  play() {
-    if (this._playing || !this._server) return;
-    this._playing    = true;
-    this._lastWallMs = null;
-    this._scheduleRaf();
-  }
-
-  pause() {
-    this._playing = false;
-    if (this._rafId !== null) {
-      cancelAnimationFrame(this._rafId);
-      this._rafId = null;
-    }
-  }
-
   /**
    * Seek to a position (seconds) and decode the exact frame at that position.
    * Uses decode_frame_at() which seeks to the preceding keyframe, flushes the
@@ -174,12 +155,9 @@ export class FrameServerBridge {
    */
   seekTo(seconds) {
     if (!this._server) return;
-    const wasPlaying = this._playing;
-    this.pause();
     this._pts = Math.max(0, Math.min(seconds, this._duration));
     const frame = this._server.decode_frame_at(this._pts);
     if (frame) this._onFrame(frame, this._pts);
-    if (wasPlaying) this.play();
   }
 
   /**
@@ -195,50 +173,13 @@ export class FrameServerBridge {
     return this._server.decode_frame_at(this._pts) || null;
   }
 
-  get isPlaying()  { return this._playing; }
   get currentPts() { return this._pts; }
   get duration()   { return this._duration; }
   get fps()        { return this._fps; }
 
-  // ── Internal playback loop ────────────────────────────────────────────────
-
-  _scheduleRaf() {
-    this._rafId = requestAnimationFrame((now) => this._tick(now));
-  }
-
-  _tick(nowMs) {
-    if (!this._playing) return;
-
-    if (this._lastWallMs === null) this._lastWallMs = nowMs;
-    const elapsed = (nowMs - this._lastWallMs) / 1000;   // seconds elapsed
-    this._lastWallMs = nowMs;
-    this._pts += elapsed;
-
-    if (this._duration > 0 && this._pts >= this._duration) {
-      this._pts = this._duration;
-      this.pause();
-      this._onEnd();
-      return;
-    }
-
-    const frame = this._server.decode_next_frame();
-    if (!frame) {
-      // Decoder returned nothing – either EOF or decode error
-      this.pause();
-      this._onEnd();
-      return;
-    }
-
-    // Pass the YUV frame object directly — gl.texImage2D consumes the
-    // WASM-backed typed_memory_views synchronously before the next decode.
-    this._onFrame(frame, this._pts);
-    this._scheduleRaf();
-  }
-
   // ── Cleanup ───────────────────────────────────────────────────────────────
 
   destroy() {
-    this.pause();
     if (this._server) { this._server.close(); this._server.delete(); this._server = null; }
   }
 }

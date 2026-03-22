@@ -15,6 +15,7 @@ import { Player }                              from './player.js';
 import { formatTimecode }                      from './timecode.js';
 import { initLayout }                          from './layout.js';
 import { Timeline }                            from './timeline.js';
+import { Playback }                            from './playback.js';
 import { initMediaBin }                        from './media_bin.js';
 import { initProject, saveProject, loadProject } from './project.js';
 
@@ -56,9 +57,7 @@ const statusBar      = document.getElementById('status');
 let player    = null;
 const pool    = new FrameServerPool();
 let seqFps    = 24;
-let isPlayingTimeline = false;
-let timelineRafId     = null;
-let playheadPts       = 0;  // µs
+let playback  = null;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -78,68 +77,24 @@ function setProgramEmpty(empty) {
 
 function initPlayer() {
   if (!player) {
-    try { player = new Player(glCanvas); }
+    try {
+      player = new Player(glCanvas);
+      playback?.setProgramPlayer(player);
+    }
     catch (err) { setStatus('WebGL init failed: ' + err.message, true); return false; }
   }
   return true;
 }
 
+function updatePlayButton(isPlaying) {
+  btnPlayPause.textContent = isPlaying ? '⏸' : '▶';
+}
+
 // ── Timeline playback ──────────────────────────────────────────────────────
 
-function renderProgramFrame(pts) {
-  if (!_engine || !_seqId) return;
-  const result = _engine.resolve_frame(_seqId, pts);
-  if (!result) { setProgramEmpty(true); return; }
-  const { source_path, source_pts } = result;
-  if (!pool.has(source_path)) return;
-  const frame = pool.decodeFrameAt(source_path, source_pts);
-  if (frame) {
-    if (!initPlayer()) return;
-    setProgramEmpty(false);
-    player.drawFrame(frame);
-  }
-}
-
-function startTimelinePlayback() {
-  if (isPlayingTimeline) return;
-  isPlayingTimeline = true;
-  btnPlayPause.textContent = '⏸';
-  let lastMs = null;
-
-  function tick(nowMs) {
-    if (!isPlayingTimeline) return;
-    if (lastMs !== null) {
-      const elapsed = (nowMs - lastMs) / 1000;
-      playheadPts += elapsed * 1e6;
-
-      const dur = _engine?.get_sequence_duration?.(_seqId) ?? 0;
-      if (dur > 0 && playheadPts >= dur) {
-        playheadPts = dur;
-        stopTimelinePlayback();
-        _timeline?.setPlayhead(playheadPts);
-        return;
-      }
-    }
-    lastMs = nowMs;
-    renderProgramFrame(playheadPts);
-    // Update timeline display without firing 'playhead-change' — that event
-    // is for user-initiated scrubbing and would call stopTimelinePlayback().
-    if (_timeline) { _timeline._playhead = playheadPts; _timeline.render(); }
-    updateTimecodeDisplay();
-    timelineRafId = requestAnimationFrame(tick);
-  }
-  timelineRafId = requestAnimationFrame(tick);
-}
-
-function stopTimelinePlayback() {
-  isPlayingTimeline = false;
-  btnPlayPause.textContent = '▶';
-  if (timelineRafId !== null) { cancelAnimationFrame(timelineRafId); timelineRafId = null; }
-}
-
 function updateTimecodeDisplay() {
-  const fps = seqFps;
-  const tc  = formatTimecode(playheadPts / 1e6, fps);
+  const pts = playback?.playheadPts ?? 0;
+  const tc  = formatTimecode(pts / 1e6, seqFps);
   if (timecodeEl)  timecodeEl.textContent  = tc;
   if (timelineTc)  timelineTc.textContent  = tc;
 }
@@ -153,11 +108,24 @@ function initTimeline() {
 
   _timeline = new Timeline(canvas, _engine, _seqId, 24, 1);
 
+  playback = new Playback({
+    timeline:          _timeline,
+    engine:            _engine,
+    pool,
+    sequenceId:        _seqId,
+    fps:               seqFps,
+    duration:          _engine.get_sequence_duration?.(_seqId) ?? 0,
+    onPlayStateChange: updatePlayButton,
+    onTimecodeUpdate:  updateTimecodeDisplay,
+    onFrameState:      (hasFrame) => setProgramEmpty(!hasFrame),
+  });
+
+  // When the user scrubs the playhead, pause and sync the Playback engine.
+  // The timeline has already updated its own _playhead and rendered; we
+  // only need to update playback state and decode the frame.
   canvas.addEventListener('playhead-change', (e) => {
-    playheadPts = e.detail.pts;
-    updateTimecodeDisplay();
-    renderProgramFrame(playheadPts);
-    if (isPlayingTimeline) stopTimelinePlayback();
+    playback.pause();
+    playback.syncPlayheadPts(e.detail.pts);
   });
 
   // Tool buttons
@@ -205,18 +173,22 @@ async function importFileToTimeline(file, trackIndex = 0, srcInPts = 0, srcOutPt
 
   seqFps = fps;
   if (_timeline) _timeline._fps_num = Math.round(fps);
+  playback?.setFps(fps);
 
   btnPlayPause.disabled = false;
   btnStepBack.disabled  = false;
   btnStepFwd.disabled   = false;
 
-  // Update duration display
+  // Update duration display and playback engine
   const totalDur = _engine.get_sequence_duration?.(_seqId) ?? 0;
   if (durationEl) durationEl.textContent = formatTimecode(totalDur / 1e6, fps);
+  playback?.setDuration(totalDur);
 
   setStatus('Added ' + file.name + ' to timeline.');
   _timeline?.render();
-  renderProgramFrame(playheadPts);
+  // Re-decode the current frame so the program monitor shows content immediately
+  initPlayer();
+  playback?.syncPlayheadPts(playback?.playheadPts ?? 0);
   setProgramEmpty(false);
 
   window.dispatchEvent(new CustomEvent('nle:clip-added', { detail: { file, clipId } }));
@@ -224,28 +196,9 @@ async function importFileToTimeline(file, trackIndex = 0, srcInPts = 0, srcOutPt
 
 // ── Transport buttons ──────────────────────────────────────────────────────
 
-btnPlayPause.addEventListener('click', () => {
-  if (isPlayingTimeline) { stopTimelinePlayback(); }
-  else                   { startTimelinePlayback(); }
-});
-
-btnStepBack.addEventListener('click', () => {
-  stopTimelinePlayback();
-  const frameDur = seqFps > 0 ? (1 / seqFps) * 1e6 : 1e6 / 24;
-  playheadPts = Math.max(0, playheadPts - frameDur);
-  _timeline?.setPlayhead(playheadPts);
-  renderProgramFrame(playheadPts);
-  updateTimecodeDisplay();
-});
-
-btnStepFwd.addEventListener('click', () => {
-  stopTimelinePlayback();
-  const frameDur = seqFps > 0 ? (1 / seqFps) * 1e6 : 1e6 / 24;
-  playheadPts += frameDur;
-  _timeline?.setPlayhead(playheadPts);
-  renderProgramFrame(playheadPts);
-  updateTimecodeDisplay();
-});
+btnPlayPause.addEventListener('click', () => { playback?.toggle(); });
+btnStepBack.addEventListener('click',  () => { playback?.stepBack(); });
+btnStepFwd.addEventListener('click',   () => { playback?.stepForward(); });
 
 // ── Keyboard shortcuts ─────────────────────────────────────────────────────
 
@@ -253,20 +206,9 @@ document.addEventListener('keydown', (e) => {
   const tag = e.target.tagName;
   if (tag === 'INPUT' || tag === 'TEXTAREA') return;
 
-  if (e.code === 'Space') {
-    e.preventDefault();
-    btnPlayPause.click();
-  }
-  if (e.code === 'ArrowRight' || e.code === 'ArrowLeft') {
-    e.preventDefault();
-    stopTimelinePlayback();
-    const frameDur = seqFps > 0 ? (1 / seqFps) * 1e6 : 1e6 / 24;
-    const dir = e.code === 'ArrowRight' ? 1 : -1;
-    playheadPts = Math.max(0, playheadPts + dir * frameDur);
-    _timeline?.setPlayhead(playheadPts);
-    renderProgramFrame(playheadPts);
-    updateTimecodeDisplay();
-  }
+  if (e.code === 'Space') { e.preventDefault(); playback?.toggle(); }
+  if (e.code === 'ArrowRight') { e.preventDefault(); playback?.stepForward(); }
+  if (e.code === 'ArrowLeft')  { e.preventDefault(); playback?.stepBack(); }
   if (e.code === 'KeyV') window.dispatchEvent(new CustomEvent('nle:tool', { detail: 'select' }));
   if (e.code === 'KeyC') window.dispatchEvent(new CustomEvent('nle:tool', { detail: 'razor' }));
   if (e.code === 'KeyH') window.dispatchEvent(new CustomEvent('nle:tool', { detail: 'hand' }));
@@ -335,7 +277,7 @@ document.getElementById('btn-load-project')?.addEventListener('click', loadProje
 // Re-render timeline when a project is loaded
 window.addEventListener('nle:project-loaded', () => {
   _timeline?.render();
-  renderProgramFrame(playheadPts);
+  playback?.syncPlayheadPts(playback.playheadPts);
 });
 
 // ── Second vertical divider sync ───────────────────────────────────────────
