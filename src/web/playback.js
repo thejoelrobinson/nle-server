@@ -1,3 +1,5 @@
+import { FrameCache } from './frame_cache.js';
+
 /**
  * playback.js – Timeline playback engine.
  *
@@ -58,6 +60,9 @@ export class Playback {
     this._frameDurMs  = 1000 / this._fps;  // ms per frame
     this._duration    = duration;           // µs
 
+    this._cache           = new FrameCache(30);
+    this._prefetchInflight = false;
+
     this._isPlaying   = false;
     this._rafId       = null;
     this._lastFrameMs = null;
@@ -96,8 +101,10 @@ export class Playback {
 
   pause() {
     if (!this._isPlaying) return;
-    this._isPlaying   = false;
-    this._lastFrameMs = null;
+    this._isPlaying        = false;
+    this._lastFrameMs      = null;
+    this._prefetchInflight = false;
+    this._cache.clear();
     if (this._rafId !== null) { cancelAnimationFrame(this._rafId); this._rafId = null; }
     this._onStateChange?.(false);
   }
@@ -129,7 +136,9 @@ export class Playback {
    * @param {number} pts — target position in µs
    */
   syncPlayheadPts(pts) {
-    this._playheadPts = pts;
+    this._playheadPts      = pts;
+    this._prefetchInflight = false;
+    this._cache.clear();
     if (this._timeline) { this._timeline._playhead = pts; this._timeline.render(); }
     this._onTimecode?.(pts);
     this._decodeAndDisplay(pts);
@@ -155,6 +164,7 @@ export class Playback {
     if (this._timeline) { this._timeline._playhead = this._playheadPts; this._timeline.render(); }
     this._onTimecode?.(this._playheadPts);
     this._decodeAndDisplay(this._playheadPts);
+    this._schedulePrefetch(this._playheadPts);
 
     // Stop at end of sequence
     if (this._duration > 0 && this._playheadPts >= this._duration) {
@@ -168,22 +178,60 @@ export class Playback {
     this._rafId = requestAnimationFrame((now2) => this._tick(now2));
   }
 
-  _decodeAndDisplay(pts) {
+  async _decodeAndDisplay(pts) {
     if (!this._engine || !this._seqId || !this._pool) return;
-    const resolved = this._engine.resolve_frame(this._seqId, pts);
-    if (!resolved) { this._onFrameState?.(false); return; }
-    const info = this._pool.getInfo(resolved.source_path);
-    // source_pts is always in NLE timebase (µs) — both the JS mirror and the
-    // C++ engine (which defaults to tb_den=1000000) store clip PTS in µs.
-    // Dividing by info.tb_den (the stream's native AVStream timebase, e.g.
-    // 90000 for MPEG-2) would give wildly wrong seconds for any non-µs stream.
-    const sourceSecs = resolved.source_pts / 1e6;
-    console.log('[Playback] resolved:', resolved, '| info:', info, '| sourceSecs:', sourceSecs); // eslint-disable-line no-console
-    const frame = this._pool.decodeFrameAt(resolved.source_path, sourceSecs);
-    if (frame && this._player) {
+    try {
+      const resolved = this._engine.resolve_frame(this._seqId, pts);
+      if (!resolved || !resolved.source_path) { this._onFrameState?.(false); return; }
+
+      const info = this._pool.getInfo(resolved.source_path);
       const colorspace = mapFFmpegColorspace(info?.colorspace ?? 5);
-      this._player.drawFrame({ ...frame, colorspace });
-      this._onFrameState?.(true);
+
+      let frame = this._cache.get(resolved.source_path, resolved.source_pts);
+      if (!frame) {
+        // source_pts is always in NLE timebase (µs) — both the JS mirror and the
+        // C++ engine (which defaults to tb_den=1000000) store clip PTS in µs.
+        frame = await this._pool.decodeFrameAt(resolved.source_path, resolved.source_pts / 1e6);
+        if (frame) this._cache.set(resolved.source_path, resolved.source_pts, frame);
+      }
+
+      if (frame && this._player) {
+        this._player.drawFrame({ ...frame, colorspace });
+        this._onFrameState?.(true);
+      }
+    } catch (e) {
+      console.warn('[Playback] decode error:', e); // eslint-disable-line no-console
     }
+  }
+
+  _schedulePrefetch(currentPts, lookahead = 5) {
+    if (this._prefetchInflight) return;
+    this._prefetchInflight = true;
+
+    const frameDuration = 1_000_000 / this._fps;
+
+    (async () => {
+      try {
+        for (let i = 1; i <= lookahead; i++) {
+          if (!this._isPlaying) break;
+          const futurePts = currentPts + i * frameDuration;
+          if (futurePts > this._duration) break;
+
+          const resolved = this._engine.resolve_frame(this._seqId, futurePts);
+          if (!resolved || !resolved.source_path) continue;
+          if (this._cache.has(resolved.source_path, resolved.source_pts)) continue;
+
+          const frame = await this._pool.decodeFrameAt(
+            resolved.source_path,
+            resolved.source_pts / 1e6
+          );
+          if (frame) this._cache.set(resolved.source_path, resolved.source_pts, frame);
+        }
+      } catch (e) {
+        console.warn('[Prefetch] error:', e); // eslint-disable-line no-console
+      } finally {
+        this._prefetchInflight = false;
+      }
+    })();
   }
 }
