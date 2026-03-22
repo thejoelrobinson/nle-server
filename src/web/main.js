@@ -122,7 +122,9 @@ function startTimelinePlayback() {
     }
     lastMs = nowMs;
     renderProgramFrame(playheadPts);
-    _timeline?.setPlayhead(playheadPts);
+    // Update timeline display without firing 'playhead-change' — that event
+    // is for user-initiated scrubbing and would call stopTimelinePlayback().
+    if (_timeline) { _timeline._playhead = playheadPts; _timeline.render(); }
     updateTimecodeDisplay();
     timelineRafId = requestAnimationFrame(tick);
   }
