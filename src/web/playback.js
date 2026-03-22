@@ -88,6 +88,10 @@ export class Playback {
     this._audio            = new AudioEngine();
     this._audioInitialized = false;
     this._lastAudioPts     = -1;
+
+    // Caches to reduce per-tick resolve_frame() calls and colorspace lookups
+    this._lastResolvedSourcePath = null;  // cached source_path for colorspace lookup
+    this._lastColorspace         = 0;     // cached colorspace value
   }
 
   // ── Getters ───────────────────────────────────────────────────────────────
@@ -163,6 +167,7 @@ export class Playback {
     this._playheadPts      = pts;
     this._prefetchInflight = false;
     this._cache.clear();
+    this._lastResolvedSourcePath = null;  // invalidate colorspace cache on external seek
     this._updateTimelineDisplay(pts);
     this._onTimecode?.(pts);
     this._decodeAndDisplay(pts);
@@ -198,12 +203,18 @@ export class Playback {
     this._playheadPts += elapsed * 1000;
     if (this._duration > 0) this._playheadPts = Math.min(this._playheadPts, this._duration);
 
+    // Resolve frame once per tick and reuse for both display and audio.
+    // This eliminates 2 redundant resolve_frame() tree walks.
+    const resolved = this._engine && this._seqId
+      ? this._engine.resolve_frame(this._seqId, this._playheadPts)
+      : null;
+
     // Update timeline display without firing 'playhead-change'
     this._updateTimelineDisplay(this._playheadPts);
     this._onTimecode?.(this._playheadPts);
-    this._decodeAndDisplay(this._playheadPts);
+    this._decodeAndDisplay(this._playheadPts, resolved);
     this._schedulePrefetch(this._playheadPts);
-    this._decodeAndPushAudio(this._playheadPts);
+    this._decodeAndPushAudio(this._playheadPts, resolved);
 
     // Stop at end of sequence
     if (this._duration > 0 && this._playheadPts >= this._duration) {
@@ -217,10 +228,13 @@ export class Playback {
     this._rafId = requestAnimationFrame((now2) => this._tick(now2));
   }
 
-  _decodeAndPushAudio(pts) {
+  _decodeAndPushAudio(pts, resolved = null) {
     try {
-      if (!this._engine || !this._seqId || !this._pool) return;
-      const resolved = this._engine.resolve_frame(this._seqId, pts);
+      if (!this._pool) return;
+      if (!resolved) {
+        if (!this._engine || !this._seqId) return;
+        resolved = this._engine.resolve_frame(this._seqId, pts);
+      }
       if (!resolved?.source_path) return;
       const targetSecs = usToSecs(pts);
       // Skip if we already decoded audio very recently (< 80 ms lookahead gap)
@@ -231,14 +245,23 @@ export class Playback {
     } catch (_e) { /* non-fatal — video keeps playing */ }
   }
 
-  _decodeAndDisplay(pts) {
-    if (!this._engine || !this._seqId || !this._pool) return;
+  _decodeAndDisplay(pts, resolved = null) {
+    if (!this._pool) return;
     try {
-      const resolved = this._engine.resolve_frame(this._seqId, pts);
+      if (!resolved) {
+        if (!this._engine || !this._seqId) return;
+        resolved = this._engine.resolve_frame(this._seqId, pts);
+      }
       if (!resolved || !resolved.source_path) { this._onFrameState?.(false); return; }
 
-      const info = this._pool.getInfo(resolved.source_path);
-      const colorspace = mapFFmpegColorspace(info?.colorspace ?? AVCOL_SPC_BT709);
+      // Cache colorspace lookup: only look up when source changes
+      let colorspace = this._lastColorspace;
+      if (resolved.source_path !== this._lastResolvedSourcePath) {
+        this._lastResolvedSourcePath = resolved.source_path;
+        const info = this._pool.getInfo(resolved.source_path);
+        colorspace = mapFFmpegColorspace(info?.colorspace ?? AVCOL_SPC_BT709);
+        this._lastColorspace = colorspace;
+      }
 
       let frame = this._cache.get(resolved.source_path, resolved.source_pts);
       if (!frame) {
