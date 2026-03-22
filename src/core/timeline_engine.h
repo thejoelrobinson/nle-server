@@ -21,6 +21,15 @@ struct ClipRef {
     int64_t     timeline_in_pts;
     int64_t     timeline_out_pts;   // = timeline_in + (source_out - source_in)
     int         track_index;
+
+    // Source stream metadata (populated from get_stream_info after opening)
+    int fps_num        = 30;
+    int fps_den        = 1;
+    int tb_num         = 1;
+    int tb_den         = 1000000;
+    int color_primaries = 1;
+    int color_trc      = 1;
+    int colorspace     = 5;  // AVCOL_SPC_SMPTE170M (BT.601 default)
 };
 
 struct Track {

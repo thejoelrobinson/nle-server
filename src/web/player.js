@@ -19,18 +19,36 @@ void main() {
 
 const FRAG_SRC = `
 precision mediump float;
-uniform sampler2D uTextureY;
-uniform sampler2D uTextureU;
-uniform sampler2D uTextureV;
+uniform sampler2D uTexY;
+uniform sampler2D uTexU;
+uniform sampler2D uTexV;
+uniform int uColorspace;
 varying vec2 vTexCoord;
+
 void main() {
-  float y = texture2D(uTextureY, vTexCoord).r;
-  float u = texture2D(uTextureU, vTexCoord).r - 0.5;
-  float v = texture2D(uTextureV, vTexCoord).r - 0.5;
-  float r = y + 1.402 * v;
-  float g = y - 0.344 * u - 0.714 * v;
-  float b = y + 1.772 * u;
-  gl_FragColor = vec4(r, g, b, 1.0);
+    float y = texture2D(uTexY, vTexCoord).r - 0.0625;
+    float u = texture2D(uTexU, vTexCoord).r - 0.5;
+    float v = texture2D(uTexV, vTexCoord).r - 0.5;
+
+    float r, g, b;
+    if (uColorspace == 1) {
+        // BT.709 (HD)
+        r = 1.164 * y + 1.793 * v;
+        g = 1.164 * y - 0.213 * u - 0.533 * v;
+        b = 1.164 * y + 2.112 * u;
+    } else if (uColorspace == 2) {
+        // BT.2020 (UHD/HDR)
+        r = 1.164 * y + 1.678 * v;
+        g = 1.164 * y - 0.188 * u - 0.652 * v;
+        b = 1.164 * y + 2.163 * u;
+    } else {
+        // BT.601 (SD/default)
+        r = 1.164 * y + 1.596 * v;
+        g = 1.164 * y - 0.392 * u - 0.813 * v;
+        b = 1.164 * y + 2.017 * u;
+    }
+
+    gl_FragColor = vec4(clamp(r, 0.0, 1.0), clamp(g, 0.0, 1.0), clamp(b, 0.0, 1.0), 1.0);
 }
 `;
 
@@ -104,12 +122,13 @@ export class Player {
     gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
 
     // ── Shader program ───────────────────────────────────────────────────
-    this.prog       = createProgram(gl, VERT_SRC, FRAG_SRC);
-    this.loc_pos    = gl.getAttribLocation(this.prog, 'a_pos');
-    this.loc_uv     = gl.getAttribLocation(this.prog, 'a_uv');
-    this.loc_texY   = gl.getUniformLocation(this.prog, 'uTextureY');
-    this.loc_texU   = gl.getUniformLocation(this.prog, 'uTextureU');
-    this.loc_texV   = gl.getUniformLocation(this.prog, 'uTextureV');
+    this.prog           = createProgram(gl, VERT_SRC, FRAG_SRC);
+    this.loc_pos        = gl.getAttribLocation(this.prog, 'a_pos');
+    this.loc_uv         = gl.getAttribLocation(this.prog, 'a_uv');
+    this.loc_texY       = gl.getUniformLocation(this.prog, 'uTexY');
+    this.loc_texU       = gl.getUniformLocation(this.prog, 'uTexU');
+    this.loc_texV       = gl.getUniformLocation(this.prog, 'uTexV');
+    this._uColorspace   = gl.getUniformLocation(this.prog, 'uColorspace');
 
     // ── Three LUMINANCE textures for Y, U, V planes ──────────────────────
     this.textureY = this._createTexture();
@@ -157,9 +176,9 @@ export class Player {
 
   /**
    * Upload a YUV420P frame and draw it.
-   * @param {{ y, u, v, width, height, strideY, strideU, strideV }} frame
+   * @param {{ y, u, v, width, height, strideY, strideU, strideV, colorspace }} frame
    */
-  drawFrame({ y, u, v, width, height, strideY, strideU, strideV }) {
+  drawFrame({ y, u, v, width, height, strideY, strideU, strideV, colorspace = 0 }) {
     const gl = this.gl;
 
     // Resize canvas backing store if dimensions changed
@@ -179,6 +198,7 @@ export class Player {
     // Draw
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.useProgram(this.prog);
+    gl.uniform1i(this._uColorspace, colorspace);
 
     gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
     const stride = 4 * 4; // 4 floats per vertex

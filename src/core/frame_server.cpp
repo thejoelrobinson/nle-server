@@ -378,6 +378,23 @@ emscripten::val FrameServer::_frame_to_result(double pts_sec) {
     return result;
 }
 
+emscripten::val FrameServer::get_stream_info() {
+    if (!fmt_ctx_ || video_stream_idx_ < 0 || !codec_ctx_) return emscripten::val::null();
+    AVStream* s = fmt_ctx_->streams[video_stream_idx_];
+    emscripten::val info = emscripten::val::object();
+    info.set("fps_num",        emscripten::val(s->r_frame_rate.num));
+    info.set("fps_den",        emscripten::val(s->r_frame_rate.den));
+    info.set("tb_num",         emscripten::val(s->time_base.num));
+    info.set("tb_den",         emscripten::val(s->time_base.den));
+    info.set("width",          emscripten::val(codec_ctx_->width));
+    info.set("height",         emscripten::val(codec_ctx_->height));
+    info.set("color_primaries",emscripten::val((int)codec_ctx_->color_primaries));
+    info.set("color_trc",      emscripten::val((int)codec_ctx_->color_trc));
+    info.set("colorspace",     emscripten::val((int)codec_ctx_->colorspace));
+    info.set("codec_id",       emscripten::val((int)codec_ctx_->codec_id));
+    return info;
+}
+
 void FrameServer::close() {
     cleanup();
 }

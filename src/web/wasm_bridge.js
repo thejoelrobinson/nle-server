@@ -173,6 +173,16 @@ export class FrameServerBridge {
     return this._server.decode_frame_at(this._pts) || null;
   }
 
+  /**
+   * Return stream metadata from the currently open file.
+   * Must be called after openFile() succeeds.
+   * @returns {object|null}
+   */
+  getStreamInfo() {
+    if (!this._server) return null;
+    return this._server.get_stream_info();
+  }
+
   get currentPts() { return this._pts; }
   get duration()   { return this._duration; }
   get fps()        { return this._fps; }
@@ -197,6 +207,7 @@ export class FrameServerBridge {
 export class FrameServerPool {
   constructor() {
     this._bridges = new Map();  // source_path → FrameServerBridge
+    this._infos   = new Map();  // source_path → stream info object
   }
 
   /**
@@ -217,6 +228,16 @@ export class FrameServerPool {
     await bridge.ready();
     await bridge.openFile(file);
     this._bridges.set(file.name, bridge);
+    this._infos.set(file.name, bridge.getStreamInfo());
+  }
+
+  /**
+   * Return stored stream info for a loaded source path.
+   * @param {string} sourcePath
+   * @returns {object|null}
+   */
+  getInfo(sourcePath) {
+    return this._infos.get(sourcePath) ?? null;
   }
 
   /**
@@ -247,5 +268,6 @@ export class FrameServerPool {
   destroy() {
     for (const bridge of this._bridges.values()) bridge.destroy();
     this._bridges.clear();
+    this._infos.clear();
   }
 }

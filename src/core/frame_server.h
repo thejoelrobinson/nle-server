@@ -35,6 +35,7 @@ public:
     int get_frame_count();
     bool seek(double timestamp_seconds);
     emscripten::val decode_next_frame();
+    emscripten::val get_stream_info();
 
     /**
      * Seek to the keyframe before target_seconds, flush the codec, then decode

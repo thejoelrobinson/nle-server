@@ -21,6 +21,7 @@ EMSCRIPTEN_BINDINGS(nle_frame_server) {
         .function("seek",             &FrameServer::seek)
         .function("decode_next_frame",&FrameServer::decode_next_frame)
         .function("decode_frame_at",  &FrameServer::decode_frame_at)
+        .function("get_stream_info",  &FrameServer::get_stream_info)
         .function("close",            &FrameServer::close)
         ;
 }

@@ -5,6 +5,10 @@
 #define __STDC_FORMAT_MACROS
 #include <inttypes.h>
 
+extern "C" {
+#include <libavutil/mathematics.h>
+}
+
 using json = nlohmann::json;
 
 // ---------------------------------------------------------------------------
@@ -337,13 +341,18 @@ emscripten::val TimelineEngine::resolve_frame(const std::string& seq_id,
         for (const auto& clip : track.clips) {
             if (timeline_pts >= clip.timeline_in_pts &&
                 timeline_pts <  clip.timeline_out_pts) {
-                int64_t offset     = timeline_pts - clip.timeline_in_pts;
-                int64_t source_pts = clip.source_in_pts + offset;
+                int64_t offset_seq  = timeline_pts - clip.timeline_in_pts;
+                int64_t offset_clip = av_rescale_q(
+                    offset_seq,
+                    AVRational{1, 1000000},
+                    AVRational{clip.tb_num, clip.tb_den}
+                );
+                int64_t source_pts  = clip.source_in_pts + offset_clip;
 
                 emscripten::val result = emscripten::val::object();
                 result.set("source_path", emscripten::val(clip.source_path));
-                result.set("source_pts",  emscripten::val(
-                    static_cast<double>(source_pts) / NLE_TIME_BASE));
+                result.set("source_pts",  emscripten::val(static_cast<double>(source_pts)));
+                result.set("colorspace",  emscripten::val(clip.colorspace));
                 return result;
             }
         }
@@ -384,7 +393,14 @@ nlohmann::json TimelineEngine::clip_to_json(const ClipRef& c) const {
         {"source_out_pts",   c.source_out_pts},
         {"timeline_in_pts",  c.timeline_in_pts},
         {"timeline_out_pts", c.timeline_out_pts},
-        {"track_index",      c.track_index}
+        {"track_index",      c.track_index},
+        {"fps_num",          c.fps_num},
+        {"fps_den",          c.fps_den},
+        {"tb_num",           c.tb_num},
+        {"tb_den",           c.tb_den},
+        {"color_primaries",  c.color_primaries},
+        {"color_trc",        c.color_trc},
+        {"colorspace",       c.colorspace}
     };
 }
 
@@ -410,6 +426,13 @@ ClipRef TimelineEngine::json_to_clip(const nlohmann::json& j) const {
     c.timeline_in_pts  = j.at("timeline_in_pts").get<int64_t>();
     c.timeline_out_pts = j.at("timeline_out_pts").get<int64_t>();
     c.track_index      = j.at("track_index").get<int>();
+    c.fps_num          = j.value("fps_num", 30);
+    c.fps_den          = j.value("fps_den", 1);
+    c.tb_num           = j.value("tb_num",  1);
+    c.tb_den           = j.value("tb_den",  1000000);
+    c.color_primaries  = j.value("color_primaries", 1);
+    c.color_trc        = j.value("color_trc", 1);
+    c.colorspace       = j.value("colorspace", 5);
     return c;
 }
 

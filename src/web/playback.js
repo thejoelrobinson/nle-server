@@ -17,6 +17,18 @@
  *    elapsed value naturally skips frames to stay in sync.
  */
 
+/**
+ * Map FFmpeg AVCOL_SPC_* value to player colorspace index.
+ * 0 = BT.601, 1 = BT.709, 2 = BT.2020
+ * @param {number} avcol_spc
+ * @returns {number}
+ */
+function mapFFmpegColorspace(avcol_spc) {
+  if (avcol_spc === 1) return 1;   // AVCOL_SPC_BT709
+  if (avcol_spc === 9) return 2;   // AVCOL_SPC_BT2020_NCL
+  return 0;                         // BT.601 default
+}
+
 export class Playback {
   /**
    * @param {object}   opts.timeline            — Timeline instance
@@ -160,9 +172,12 @@ export class Playback {
     if (!this._engine || !this._seqId || !this._pool) return;
     const resolved = this._engine.resolve_frame(this._seqId, pts);
     if (!resolved) { this._onFrameState?.(false); return; }
-    const frame = this._pool.decodeFrameAt(resolved.source_path, resolved.source_pts);
+    const info = this._pool.getInfo(resolved.source_path);
+    const sourceSecs = resolved.source_pts / (info?.tb_den ?? 1000000);
+    const frame = this._pool.decodeFrameAt(resolved.source_path, sourceSecs);
     if (frame && this._player) {
-      this._player.drawFrame(frame);
+      const colorspace = mapFFmpegColorspace(info?.colorspace ?? 5);
+      this._player.drawFrame({ ...frame, colorspace });
       this._onFrameState?.(true);
     }
   }
