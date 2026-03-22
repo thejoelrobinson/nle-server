@@ -173,7 +173,12 @@ export class Playback {
     const resolved = this._engine.resolve_frame(this._seqId, pts);
     if (!resolved) { this._onFrameState?.(false); return; }
     const info = this._pool.getInfo(resolved.source_path);
-    const sourceSecs = resolved.source_pts / (info?.tb_den ?? 1000000);
+    // source_pts is always in NLE timebase (µs) — both the JS mirror and the
+    // C++ engine (which defaults to tb_den=1000000) store clip PTS in µs.
+    // Dividing by info.tb_den (the stream's native AVStream timebase, e.g.
+    // 90000 for MPEG-2) would give wildly wrong seconds for any non-µs stream.
+    const sourceSecs = resolved.source_pts / 1e6;
+    console.log('[Playback] resolved:', resolved, '| info:', info, '| sourceSecs:', sourceSecs); // eslint-disable-line no-console
     const frame = this._pool.decodeFrameAt(resolved.source_path, sourceSecs);
     if (frame && this._player) {
       const colorspace = mapFFmpegColorspace(info?.colorspace ?? 5);
