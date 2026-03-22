@@ -196,7 +196,10 @@ async function importFileToTimeline(file, trackIndex = 0, srcInPts = 0, srcOutPt
 
 // ── Transport buttons ──────────────────────────────────────────────────────
 
-btnPlayPause.addEventListener('click', () => { playback?.toggle(); });
+btnPlayPause.addEventListener('click', () => {
+  console.log('[main] play button clicked — playback:', !!playback, 'isPlaying:', playback?.isPlaying); // eslint-disable-line no-console
+  playback?.toggle();
+});
 btnStepBack.addEventListener('click',  () => { playback?.stepBack(); });
 btnStepFwd.addEventListener('click',   () => { playback?.stepForward(); });
 

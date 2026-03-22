@@ -76,6 +76,7 @@ export class Playback {
 
   play() {
     if (this._isPlaying) return;
+    console.log('[Playback] play() — engine:', !!this._engine, 'pool:', !!this._pool, 'player:', !!this._player, 'seqId:', this._seqId, 'duration:', this._duration); // eslint-disable-line no-console
     this._isPlaying   = true;
     this._lastFrameMs = null;
     this._rafId = requestAnimationFrame((now) => this._tick(now));
@@ -140,9 +141,19 @@ export class Playback {
     if (this._duration > 0) this._playheadPts = Math.min(this._playheadPts, this._duration);
 
     // Update timeline display without firing 'playhead-change'
-    if (this._timeline) { this._timeline._playhead = this._playheadPts; this._timeline.render(); }
+    try {
+      if (this._timeline) { this._timeline._playhead = this._playheadPts; this._timeline.render(); }
+    } catch (err) {
+      console.error('[Playback] _tick: timeline.render() threw:', err); // eslint-disable-line no-console
+    }
+
     this._onTimecode?.(this._playheadPts);
-    this._decodeAndDisplay(this._playheadPts);
+
+    try {
+      this._decodeAndDisplay(this._playheadPts);
+    } catch (err) {
+      console.error('[Playback] _tick: _decodeAndDisplay() threw:', err); // eslint-disable-line no-console
+    }
 
     // Stop at end of sequence
     if (this._duration > 0 && this._playheadPts >= this._duration) {
@@ -157,13 +168,22 @@ export class Playback {
   }
 
   _decodeAndDisplay(pts) {
-    if (!this._engine || !this._seqId || !this._pool) return;
+    if (!this._engine || !this._seqId || !this._pool) {
+      console.log('[Playback] _decodeAndDisplay: missing dependency — engine:', !!this._engine, 'seqId:', !!this._seqId, 'pool:', !!this._pool); // eslint-disable-line no-console
+      return;
+    }
     const resolved = this._engine.resolve_frame(this._seqId, pts);
     if (!resolved) { this._onFrameState?.(false); return; }
     const frame = this._pool.decodeFrameAt(resolved.source_path, resolved.source_pts);
-    if (frame && this._player) {
-      this._player.drawFrame(frame);
-      this._onFrameState?.(true);
+    if (!frame) {
+      console.warn('[Playback] decodeFrameAt returned null — source:', resolved.source_path, 'pts:', resolved.source_pts); // eslint-disable-line no-console
+      return;
     }
+    if (!this._player) {
+      console.warn('[Playback] _player is null — frame decoded but cannot draw'); // eslint-disable-line no-console
+      return;
+    }
+    this._player.drawFrame(frame);
+    this._onFrameState?.(true);
   }
 }
