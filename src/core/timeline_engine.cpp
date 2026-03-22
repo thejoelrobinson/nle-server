@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <sstream>
+#define __STDC_FORMAT_MACROS
+#include <inttypes.h>
 
 using json = nlohmann::json;
 
