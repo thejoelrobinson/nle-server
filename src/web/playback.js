@@ -236,7 +236,9 @@ export class Playback {
     // ── Draw from cache — zero WASM calls ─────────────────────────────────
     if (resolved?.source_path && this._player) {
       // Round source_pts to avoid floating-point key mismatches between _tick and _decodeLoop.
-      const frame = this._cache.get(resolved.source_path, Math.round(resolved.source_pts));
+      const roundedPts = Math.round(resolved.source_pts);
+      const frame = this._cache.get(resolved.source_path, roundedPts);
+      console.log('[_tick] resolved:', resolved?.source_path ?? 'null', '| cache hit:', !!frame, '| pts:', roundedPts); // eslint-disable-line no-console
       if (frame) {
         // Colorspace: only look up when source file changes
         if (resolved.source_path !== this._lastResolvedSourcePath) {
@@ -308,13 +310,28 @@ export class Playback {
         if (this._cache.has(resolved.source_path, sourcePts)) continue;
 
         // decodeFrameAt is async on both the WebCodecs and WASM paths.
-        const frameData = await this._pool.decodeFrameAt(
-          resolved.source_path,
-          usToSecs(resolved.source_pts)
-        );
+        // Wrap in try/catch: any decode error must NOT kill the loop — a
+        // single bad frame should be skipped, not crash the entire prefetch.
+        let frameData;
+        try {
+          frameData = await this._pool.decodeFrameAt(
+            resolved.source_path,
+            usToSecs(resolved.source_pts)
+          );
+          console.log('[_decodeLoop] resolve_frame →', resolved, '| frameData:', frameData ? 'ok' : 'null'); // eslint-disable-line no-console
+        } catch (e) {
+          console.warn('[Playback] _decodeLoop decode error (skipping frame):', e); // eslint-disable-line no-console
+          continue;
+        }
         if (!frameData) continue;
 
-        const cached = await _toImageBitmapIfNeeded(frameData);
+        let cached;
+        try {
+          cached = await _toImageBitmapIfNeeded(frameData);
+        } catch (e) {
+          console.warn('[Playback] _decodeLoop bitmap conversion error (skipping frame):', e); // eslint-disable-line no-console
+          continue;
+        }
         if (cached) this._cache.set(resolved.source_path, sourcePts, cached);
       }
 
