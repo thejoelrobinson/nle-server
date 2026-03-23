@@ -12,12 +12,17 @@ import { frameDurationUs, usToSecs } from './timecode.js';
  *  - Wall-clock elapsed time (rAF timestamp) drives playhead advancement.
  *  - Delta is clamped to 2× frame duration so a backgrounded tab can't
  *    jump the playhead by seconds when it resumes.
- *  - Timeline is updated directly (_timeline._playhead + render()) during
- *    the rAF tick to avoid dispatching 'playhead-change', which would
- *    trigger the scrub listener and kill playback.
- *  - decodeAndDisplay is fire-and-forget (async internally but caller doesn't wait).
- *    If decode is slow the next tick's larger elapsed value naturally skips frames
- *    to stay in sync.
+ *  - _tick() ONLY reads from the frame cache and draws — it never calls the
+ *    WASM decoder synchronously, which was causing [Violation] rAF handler
+ *    took <N>ms on 4K frames.
+ *  - _decodeLoop() runs as a fire-and-forget async loop alongside the rAF,
+ *    prefetching frames into the cache between rAF ticks using setTimeout(4)
+ *    yields so the main thread stays responsive.
+ *  - Timeline canvas is repainted every other rAF tick (~30 fps) rather than
+ *    every tick (~60 fps), halving canvas 2D overdraw cost.
+ *  - Timeline is updated directly (_timeline._playhead + render()) during the
+ *    rAF tick to avoid dispatching 'playhead-change', which would trigger the
+ *    scrub listener and kill playback.
  */
 
 import { AudioEngine } from './audio_engine.js';
@@ -43,6 +48,21 @@ function mapFFmpegColorspace(avcol_spc) {
   return COLORSPACE_DEFAULT;
 }
 
+/**
+ * Compute how many decoded frames to hold in the cache, bounded by a 256 MB
+ * memory budget.  For 4K (3840×2160 YUV420p ≈ 12 MB/frame) this yields ~21
+ * frames; for 1080p (~3 MB/frame) the cap of 30 applies.
+ *
+ * @param {number} width
+ * @param {number} height
+ * @returns {number} cache capacity in frames
+ */
+function computeCacheSize(width, height) {
+  const frameMB  = (width * height * 1.5) / (1024 * 1024); // YUV420p bytes → MB
+  const budgetMB = 256;
+  return Math.max(4, Math.min(30, Math.floor(budgetMB / frameMB)));
+}
+
 export class Playback {
   /**
    * @param {object}   opts.timeline            — Timeline instance
@@ -51,6 +71,8 @@ export class Playback {
    * @param {string}   opts.sequenceId          — current sequence ID
    * @param {number}   [opts.fps=24]            — frames per second
    * @param {number}   [opts.duration=0]        — sequence duration in µs
+   * @param {number}   [opts.width=1920]        — sequence width (for cache sizing)
+   * @param {number}   [opts.height=1080]       — sequence height (for cache sizing)
    * @param {function} [opts.onPlayStateChange] — called with (isPlaying: bool)
    * @param {function} [opts.onTimecodeUpdate]  — called with (pts: µs) each tick
    * @param {function} [opts.onFrameState]      — called with (hasFrame: bool)
@@ -58,6 +80,7 @@ export class Playback {
   constructor({
     timeline, engine, pool, sequenceId,
     fps = 24, duration = 0,
+    width = 1920, height = 1080,
     onPlayStateChange = null,
     onTimecodeUpdate  = null,
     onFrameState      = null,
@@ -72,13 +95,13 @@ export class Playback {
     this._frameDurMs  = 1000 / this._fps;  // ms per frame
     this._duration    = duration;           // µs
 
-    this._cache           = new FrameCache(30);
-    this._prefetchInflight = false;
+    this._cache = new FrameCache(computeCacheSize(width, height));
 
     this._isPlaying   = false;
     this._rafId       = null;
     this._lastFrameMs = null;
     this._playheadPts = 0;          // µs
+    this._tickCount   = 0;          // for timeline render throttle
 
     this._onStateChange = onPlayStateChange;
     this._onTimecode    = onTimecodeUpdate;
@@ -89,9 +112,9 @@ export class Playback {
     this._audioInitialized = false;
     this._lastAudioPts     = -1;
 
-    // Caches to reduce per-tick resolve_frame() calls and colorspace lookups
-    this._lastResolvedSourcePath = null;  // cached source_path for colorspace lookup
-    this._lastColorspace         = 0;     // cached colorspace value
+    // Cache colorspace lookup: only re-query when source file changes
+    this._lastResolvedSourcePath = null;
+    this._lastColorspace         = 0;
   }
 
   // ── Getters ───────────────────────────────────────────────────────────────
@@ -117,6 +140,7 @@ export class Playback {
     if (this._isPlaying) return;
     this._isPlaying   = true;
     this._lastFrameMs = null;
+    this._tickCount   = 0;
     // Audio init must happen inside a user-gesture handler; play() is one.
     if (!this._audioInitialized) {
       this._audio.init().then(() => { this._audio.start(); });
@@ -125,14 +149,14 @@ export class Playback {
       this._audio.start();
     }
     this._rafId = requestAnimationFrame((now) => this._tick(now));
+    this._decodeLoop(); // fire-and-forget async prefetch loop
     this._onStateChange?.(true);
   }
 
   pause() {
     if (!this._isPlaying) return;
-    this._isPlaying        = false;
-    this._lastFrameMs      = null;
-    this._prefetchInflight = false;
+    this._isPlaying   = false;   // also stops _decodeLoop
+    this._lastFrameMs = null;
     this._cache.clear();
     if (this._rafId !== null) { cancelAnimationFrame(this._rafId); this._rafId = null; }
     this._audio.stop();
@@ -164,10 +188,9 @@ export class Playback {
    * @param {number} pts — target position in µs
    */
   syncPlayheadPts(pts) {
-    this._playheadPts      = pts;
-    this._prefetchInflight = false;
+    this._playheadPts            = pts;
     this._cache.clear();
-    this._lastResolvedSourcePath = null;  // invalidate colorspace cache on external seek
+    this._lastResolvedSourcePath = null;  // invalidate colorspace cache on seek
     this._updateTimelineDisplay(pts);
     this._onTimecode?.(pts);
     this._decodeAndDisplay(pts);
@@ -187,12 +210,12 @@ export class Playback {
     }
   }
 
-  // ── Internal rAF loop ─────────────────────────────────────────────────────
+  // ── rAF tick — ONLY cache lookup + draw, NO decode ───────────────────────
 
   _tick(now) {
     if (!this._isPlaying) return;
 
-    // Elapsed since last tick.  Cap at 2× frame duration so a backgrounded
+    // Elapsed since last tick. Cap at 2× frame duration so a backgrounded
     // tab can't jump the playhead by seconds when it comes back.
     const elapsed = this._lastFrameMs !== null
       ? Math.min(now - this._lastFrameMs, this._frameDurMs * 2)
@@ -203,17 +226,37 @@ export class Playback {
     this._playheadPts += elapsed * 1000;
     if (this._duration > 0) this._playheadPts = Math.min(this._playheadPts, this._duration);
 
-    // Resolve frame once per tick and reuse for both display and audio.
-    // This eliminates 2 redundant resolve_frame() tree walks.
+    // Resolve frame mapping once (reused for display and audio below).
     const resolved = this._engine && this._seqId
       ? this._engine.resolve_frame(this._seqId, this._playheadPts)
       : null;
 
-    // Update timeline display without firing 'playhead-change'
-    this._updateTimelineDisplay(this._playheadPts);
+    // ── Draw from cache — zero WASM calls ─────────────────────────────────
+    if (resolved?.source_path && this._player) {
+      const frame = this._cache.get(resolved.source_path, resolved.source_pts);
+      if (frame) {
+        // Colorspace: only look up when source file changes
+        if (resolved.source_path !== this._lastResolvedSourcePath) {
+          this._lastResolvedSourcePath = resolved.source_path;
+          const info = this._pool.getInfo(resolved.source_path);
+          this._lastColorspace = mapFFmpegColorspace(info?.colorspace ?? AVCOL_SPC_BT709);
+        }
+        this._player.drawFrame({ ...frame, colorspace: this._lastColorspace });
+        this._onFrameState?.(true);
+      }
+    }
+
+    // ── Timeline: repaint every other tick (~30 fps) ──────────────────────
+    this._tickCount++;
+    if (this._tickCount % 2 === 0) {
+      this._updateTimelineDisplay(this._playheadPts);
+    } else {
+      // Still advance the internal playhead so the next full repaint is right.
+      if (this._timeline) this._timeline._playhead = this._playheadPts;
+    }
     this._onTimecode?.(this._playheadPts);
-    this._decodeAndDisplay(this._playheadPts, resolved);
-    this._schedulePrefetch(this._playheadPts);
+
+    // ── Audio (throttled inside _decodeAndPushAudio) ──────────────────────
     this._decodeAndPushAudio(this._playheadPts, resolved);
 
     // Stop at end of sequence
@@ -227,6 +270,48 @@ export class Playback {
 
     this._rafId = requestAnimationFrame((now2) => this._tick(now2));
   }
+
+  // ── Async decode loop — runs between rAF ticks ───────────────────────────
+
+  /**
+   * Continuously prefetch frames ahead of the playhead into the cache.
+   * Runs as a fire-and-forget async loop alongside the rAF loop.  Yields
+   * every 4 ms via setTimeout so the main thread stays unblocked between
+   * rAF callbacks.
+   *
+   * The loop terminates as soon as _isPlaying becomes false.
+   */
+  async _decodeLoop() {
+    const lookahead = 5;
+
+    while (this._isPlaying) {
+      const pts          = this._playheadPts;
+      const frameDuration = frameDurationUs(this._fps);
+
+      for (let i = 0; i <= lookahead; i++) {
+        if (!this._isPlaying) break;
+
+        const targetPts = pts + i * frameDuration;
+        if (this._duration > 0 && targetPts > this._duration) break;
+
+        const resolved = this._engine?.resolve_frame(this._seqId, targetPts);
+        if (!resolved?.source_path) continue;
+        if (this._cache.has(resolved.source_path, resolved.source_pts)) continue;
+
+        const frame = this._pool.decodeFrameAt(
+          resolved.source_path,
+          usToSecs(resolved.source_pts)
+        );
+        if (frame) this._cache.set(resolved.source_path, resolved.source_pts, frame);
+      }
+
+      // Yield to the event loop between decode rounds so rAF callbacks
+      // and other microtasks are not starved.
+      await new Promise((r) => setTimeout(r, 4));
+    }
+  }
+
+  // ── Audio decode (throttled, stays in tick for low latency) ──────────────
 
   _decodeAndPushAudio(pts, resolved = null) {
     try {
@@ -245,6 +330,8 @@ export class Playback {
     } catch (_e) { /* non-fatal — video keeps playing */ }
   }
 
+  // ── Synchronous decode used only for scrub / step (not in rAF) ───────────
+
   _decodeAndDisplay(pts, resolved = null) {
     if (!this._pool) return;
     try {
@@ -254,7 +341,7 @@ export class Playback {
       }
       if (!resolved || !resolved.source_path) { this._onFrameState?.(false); return; }
 
-      // Cache colorspace lookup: only look up when source changes
+      // Colorspace: only look up when source changes
       let colorspace = this._lastColorspace;
       if (resolved.source_path !== this._lastResolvedSourcePath) {
         this._lastResolvedSourcePath = resolved.source_path;
@@ -265,8 +352,6 @@ export class Playback {
 
       let frame = this._cache.get(resolved.source_path, resolved.source_pts);
       if (!frame) {
-        // source_pts is always in NLE timebase (µs) — both the JS mirror and the
-        // C++ engine (which defaults to tb_den=1000000) store clip PTS in µs.
         frame = this._pool.decodeFrameAt(resolved.source_path, usToSecs(resolved.source_pts));
         if (frame) this._cache.set(resolved.source_path, resolved.source_pts, frame);
       }
@@ -278,36 +363,5 @@ export class Playback {
     } catch (e) {
       console.warn('[Playback] decode error:', e); // eslint-disable-line no-console
     }
-  }
-
-  _schedulePrefetch(currentPts, lookahead = 5) {
-    if (this._prefetchInflight) return;
-    this._prefetchInflight = true;
-
-    const frameDuration = frameDurationUs(this._fps);
-
-    (async () => {
-      try {
-        for (let i = 1; i <= lookahead; i++) {
-          if (!this._isPlaying) break;
-          const futurePts = currentPts + i * frameDuration;
-          if (futurePts > this._duration) break;
-
-          const resolved = this._engine.resolve_frame(this._seqId, futurePts);
-          if (!resolved || !resolved.source_path) continue;
-          if (this._cache.has(resolved.source_path, resolved.source_pts)) continue;
-
-          const frame = await this._pool.decodeFrameAt(
-            resolved.source_path,
-            usToSecs(resolved.source_pts)
-          );
-          if (frame) this._cache.set(resolved.source_path, resolved.source_pts, frame);
-        }
-      } catch (e) {
-        console.warn('[Prefetch] error:', e); // eslint-disable-line no-console
-      } finally {
-        this._prefetchInflight = false;
-      }
-    })();
   }
 }

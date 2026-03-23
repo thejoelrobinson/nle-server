@@ -89,6 +89,11 @@ export class Player {
     if (!gl) throw new Error('WebGL not supported');
     this.gl = gl;
 
+    // Track whether textures have been allocated so we can use texSubImage2D
+    // (no GPU realloc) for subsequent same-size uploads.  Saves ~3 × 8 MB of
+    // driver-side reallocation every frame for 4K sources.
+    this._textureInitialized = false;
+
     this._initGL();
   }
 
@@ -135,6 +140,11 @@ export class Player {
     this.textureU = this._createTexture();
     this.textureV = this._createTexture();
 
+    // Without UNPACK_ALIGNMENT=1, WebGL pads each row to a 4-byte boundary.
+    // For odd-width chroma planes (e.g. 1920-wide U/V at 4K) that causes
+    // corrupted textures.  Setting 1 means no implicit padding.
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+
     gl.clearColor(0, 0, 0, 1);
   }
 
@@ -142,13 +152,19 @@ export class Player {
    * Upload a single luminance plane and handle stride padding.
    * WebGL1 has no UNPACK_ROW_LENGTH, so rows with padding must be stripped.
    *
+   * On the first upload (isUpdate=false) texImage2D allocates GPU memory.
+   * On subsequent uploads of the same dimensions (isUpdate=true) texSubImage2D
+   * reuses the allocation, avoiding a GPU realloc + driver sync on every frame.
+   * For 4K this saves ~3 × 8 MB of reallocation per frame.
+   *
    * @param {WebGLTexture} texture
-   * @param {Uint8Array}   data    – raw plane bytes (may include row padding)
-   * @param {number}       width   – logical pixel width of this plane
-   * @param {number}       height  – logical pixel height of this plane
-   * @param {number}       stride  – bytes per row (>= width when padded)
+   * @param {Uint8Array}   data     – raw plane bytes (may include row padding)
+   * @param {number}       width    – logical pixel width of this plane
+   * @param {number}       height   – logical pixel height of this plane
+   * @param {number}       stride   – bytes per row (>= width when padded)
+   * @param {boolean}      isUpdate – true → texSubImage2D, false → texImage2D
    */
-  _uploadPlane(texture, data, width, height, stride) {
+  _uploadPlane(texture, data, width, height, stride, isUpdate) {
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, texture);
 
@@ -166,12 +182,21 @@ export class Player {
       }
     }
 
-    gl.texImage2D(
-      gl.TEXTURE_2D, 0, gl.LUMINANCE,
-      width, height, 0,
-      gl.LUMINANCE, gl.UNSIGNED_BYTE,
-      pixels
-    );
+    if (isUpdate) {
+      gl.texSubImage2D(
+        gl.TEXTURE_2D, 0, 0, 0,
+        width, height,
+        gl.LUMINANCE, gl.UNSIGNED_BYTE,
+        pixels
+      );
+    } else {
+      gl.texImage2D(
+        gl.TEXTURE_2D, 0, gl.LUMINANCE,
+        width, height, 0,
+        gl.LUMINANCE, gl.UNSIGNED_BYTE,
+        pixels
+      );
+    }
   }
 
   /**
@@ -181,19 +206,25 @@ export class Player {
   drawFrame({ y, u, v, width, height, strideY, strideU, strideV, colorspace = 0 }) {
     const gl = this.gl;
 
-    // Resize canvas backing store if dimensions changed
+    // Resize canvas backing store if dimensions changed.
+    // Also reset _textureInitialized so the next upload uses texImage2D to
+    // reallocate GPU texture storage at the new size.
     if (this.canvas.width !== width || this.canvas.height !== height) {
       this.canvas.width  = width;
       this.canvas.height = height;
       gl.viewport(0, 0, width, height);
       this.width  = width;
       this.height = height;
+      this._textureInitialized = false;
     }
 
-    // Upload the three planes
-    this._uploadPlane(this.textureY, y, width,    height,    strideY);
-    this._uploadPlane(this.textureU, u, width>>1, height>>1, strideU);
-    this._uploadPlane(this.textureV, v, width>>1, height>>1, strideV);
+    // Upload the three planes.  Use texSubImage2D (no GPU realloc) for
+    // same-size frames after the first upload.
+    const isUpdate = this._textureInitialized;
+    this._uploadPlane(this.textureY, y, width,    height,    strideY, isUpdate);
+    this._uploadPlane(this.textureU, u, width>>1, height>>1, strideU, isUpdate);
+    this._uploadPlane(this.textureV, v, width>>1, height>>1, strideV, isUpdate);
+    this._textureInitialized = true;
 
     // Draw
     gl.clear(gl.COLOR_BUFFER_BIT);

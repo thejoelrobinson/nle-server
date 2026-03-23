@@ -431,6 +431,8 @@ export class FrameServerPool {
     const entry = this._pool.get(sourcePath);
     if (!entry) return null;
     const bridge = (useProxy && entry.proxyBridge) ? entry.proxyBridge : entry.bridge;
+    // Temporary diagnostic — remove after confirming proxy is used for long-GOP sources.
+    console.log(`[decode] ${sourcePath} | proxy=${!!entry.proxyBridge} | using=${useProxy && entry.proxyBridge ? 'PROXY' : 'SOURCE'}`); // eslint-disable-line no-console
     return bridge.decodeFrameAt(seconds);
   }
 
