@@ -158,32 +158,37 @@ export class FrameServerBridge {
 
   async _initWebCodecs() {
     this._webcodecs = null;   // reset on each open()
-    if (!WebCodecsDecoder.isSupported()) return;
-
-    const info = this._server.get_stream_info();
-    if (!info) return;
-
-    const codecStr = WebCodecsDecoder.codecStringFromId(info.codec_id);
-    if (!codecStr) return;
-
-    const supported = await WebCodecsDecoder.isCodecSupported(codecStr);
-    if (!supported) return;
-
-    const extradata = this._server.get_extradata();   // Uint8Array or null
-
-    const decoder = new WebCodecsDecoder();
     try {
-      await decoder.init({
-        codec:        codecStr,
-        codedWidth:   info.width,
-        codedHeight:  info.height,
-        description:  extradata ?? undefined,
-      });
-      this._webcodecs = decoder;
-      console.log(`[Bridge] WebCodecs active for codec ${codecStr} (hardware)`); // eslint-disable-line no-console
+      if (!WebCodecsDecoder.isSupported()) return;
+
+      const info = this._server.get_stream_info();
+      if (!info) return;
+
+      const codecStr = WebCodecsDecoder.codecStringFromId(info.codec_id);
+      if (!codecStr) return;
+
+      const supported = await WebCodecsDecoder.isCodecSupported(codecStr);
+      if (!supported) return;
+
+      const extradata = this._server.get_extradata();   // Uint8Array or null
+
+      const decoder = new WebCodecsDecoder();
+      try {
+        await decoder.init({
+          codec:        codecStr,
+          codedWidth:   info.width,
+          codedHeight:  info.height,
+          description:  extradata ?? undefined,
+        });
+        this._webcodecs = decoder;
+        console.log(`[Bridge] WebCodecs active for codec ${codecStr} (hardware)`); // eslint-disable-line no-console
+      } catch (e) {
+        console.warn('[Bridge] WebCodecs init failed, falling back to WASM:', e); // eslint-disable-line no-console
+        decoder.destroy();
+      }
     } catch (e) {
-      console.warn('[Bridge] WebCodecs init failed, falling back to WASM:', e); // eslint-disable-line no-console
-      decoder.destroy();
+      console.warn('[Bridge] WebCodecs init failed, using WASM fallback:', e.message); // eslint-disable-line no-console
+      this._webcodecs = null;
     }
   }
 
