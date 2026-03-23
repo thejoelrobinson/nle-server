@@ -18,6 +18,8 @@ import { Timeline }                            from './timeline.js';
 import { Playback }                            from './playback.js';
 import { initMediaBin }                        from './media_bin.js';
 import { initProject, saveProject, loadProject } from './project.js';
+import { initSequenceCreator }                 from './sequence_creator.js';
+import { initSequenceSettings }                from './sequence_settings.js';
 
 // ── Init layout (draggable dividers) ──────────────────────────────────────
 initLayout();
@@ -34,11 +36,14 @@ let _timeline = null;
 function _getOrCreateEngineAndSeq() {
   if (_engine && _seqId) return;
 
-  // Lazy-import the JS mirror from the test file isn't suitable here —
-  // instead we expose a lightweight inline version for app use.
-  // The real WASM get_timeline_engine() will replace this when WASM is loaded.
   _engine = _buildJsMirrorEngine();
-  _seqId  = _engine.create_sequence('Sequence 1', 1920, 1080, 24, 1);
+  _seqId  = _engine.create_sequence('Sequence 01', 1920, 1080, 24, 1);
+
+  // Set program monitor badge immediately
+  requestAnimationFrame(() => {
+    const badge = document.getElementById('program-seq-name');
+    if (badge) badge.textContent = 'Sequence 01';
+  });
 }
 
 // ── Player (Program Monitor canvas) ──────────────────────────────────────
@@ -107,6 +112,7 @@ function initTimeline() {
   if (!canvas || _timeline) return;
 
   _timeline = new Timeline(canvas, _engine, _seqId, 24, 1);
+  _timeline.setPool(pool);
 
   playback = new Playback({
     timeline:          _timeline,
@@ -121,11 +127,48 @@ function initTimeline() {
   });
 
   // When the user scrubs the playhead, pause and sync the Playback engine.
-  // The timeline has already updated its own _playhead and rendered; we
-  // only need to update playback state and decode the frame.
   canvas.addEventListener('playhead-change', (e) => {
     playback.pause();
     playback.syncPlayheadPts(e.detail.pts);
+  });
+
+  // Drop clips from Media Bin onto the timeline canvas
+  canvas.addEventListener('nle:drop-clips', async (e) => {
+    const { paths, trackIndex, dropPts } = e.detail;
+    let currentPts = dropPts;
+    for (const path of paths) {
+      // Ensure file is in the pool
+      if (!pool.has(path)) continue;
+      const bridge = pool.getBridge(path);
+      const dur    = bridge?.duration ?? 10;
+      const fps    = bridge?.fps      ?? 24;
+      const durPts = Math.round(dur * 1e6);
+
+      const clipId = _engine.add_clip(_seqId, path, trackIndex, currentPts, 0, durPts);
+      if (clipId) {
+        currentPts += durPts;
+        seqFps = fps;
+        if (_timeline) _timeline._fps_num = Math.round(fps);
+        playback?.setFps(fps);
+      }
+    }
+
+    const totalDur = _engine.get_sequence_duration?.(_seqId) ?? 0;
+    if (durationEl) durationEl.textContent = formatTimecode(totalDur / 1e6, seqFps);
+    playback?.setDuration(totalDur);
+    _timeline?.render();
+
+    btnPlayPause.disabled = false;
+    btnStepBack.disabled  = false;
+    btnStepFwd.disabled   = false;
+
+    initPlayer();
+    playback?.syncPlayheadPts(playback?.playheadPts ?? 0);
+    setProgramEmpty(false);
+    setStatus(`Added ${paths.length} clip${paths.length > 1 ? 's' : ''} to timeline.`);
+
+    // Notify sequence settings bar to refresh
+    window.dispatchEvent(new CustomEvent('nle:sequence-changed'));
   });
 
   // Tool buttons
@@ -192,6 +235,7 @@ async function importFileToTimeline(file, trackIndex = 0, srcInPts = 0, srcOutPt
   setProgramEmpty(false);
 
   window.dispatchEvent(new CustomEvent('nle:clip-added', { detail: { file, clipId } }));
+  window.dispatchEvent(new CustomEvent('nle:sequence-changed'));
 }
 
 // ── Transport buttons ──────────────────────────────────────────────────────
@@ -239,12 +283,29 @@ window.addEventListener('nle:open-source', async (e) => {
   window.dispatchEvent(new CustomEvent('nle:show-in-source', { detail: { sourcePath: path, pool } }));
 });
 
-// Expose engine + pool + seqId for MediaBin, SourceMonitor, and ProjectManager
+// Expose engine + pool + seqId for MediaBin, SourceMonitor, ProjectManager, and Phase-4 modules
 window._nle = {
   get engine() { return _engine; },
   get seqId()  { return _seqId; },
   get pool()   { return pool; },
   importFileToTimeline,
+
+  /** Switch the active sequence to a newly-created one */
+  switchSequence(newSeqId, fps_num, fps_den) {
+    _seqId = newSeqId;
+    seqFps = fps_num / (fps_den || 1);
+    if (_timeline) {
+      _timeline._seqId   = newSeqId;
+      _timeline._fps_num = fps_num;
+      _timeline._fps_den = fps_den;
+      _timeline.render();
+    }
+    playback?.setSequenceId(newSeqId);
+    playback?.setFps(seqFps);
+    playback?.setDuration(_engine.get_sequence_duration?.(newSeqId) ?? 0);
+    playback?.syncPlayheadPts(0);
+    window.dispatchEvent(new CustomEvent('nle:sequence-changed'));
+  },
 };
 
 // ── WASM pre-warm + timeline init ──────────────────────────────────────────
@@ -263,11 +324,13 @@ _warmup.ready()
   .then(() => setStatus('Ready — drag video files here or use Import.'))
   .catch(() => {});
 
-// Init timeline canvas, media bin, and project manager after first paint
+// Init timeline canvas, media bin, project manager, and Phase-4 modules after first paint
 requestAnimationFrame(() => {
   initTimeline();
   initMediaBin();
   initProject();
+  initSequenceCreator();
+  initSequenceSettings();
 });
 
 // Save / Load project buttons

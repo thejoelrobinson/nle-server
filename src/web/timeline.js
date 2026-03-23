@@ -16,6 +16,7 @@
  *   .setTool(name)              → 'select' | 'razor' | 'hand'
  *   .render()                   → force redraw
  *   .destroy()                  → remove listeners
+ *   .setPool(pool)              → provide FrameServerPool for drag-drop duration lookup
  *
  * Events dispatched on the canvas element:
  *   'playhead-change'  { detail: { pts } }
@@ -52,6 +53,7 @@ export class Timeline {
     this._seqId   = seqId;
     this._fps_num = fps_num;
     this._fps_den = fps_den;
+    this._pool    = null;   // set via setPool() once available
 
     // View state
     this._zoom      = 100;   // px per second
@@ -84,6 +86,14 @@ export class Timeline {
     canvas.addEventListener('mouseup',   this._onMouseUp);
     canvas.addEventListener('dblclick',  this._onDblClick);
 
+    // Drag-and-drop from Media Bin
+    this._onDragOver  = this._onDragOver.bind(this);
+    this._onDragLeave = this._onDragLeave.bind(this);
+    this._onDrop      = this._onDrop.bind(this);
+    canvas.addEventListener('dragover',  this._onDragOver);
+    canvas.addEventListener('dragleave', this._onDragLeave);
+    canvas.addEventListener('drop',      this._onDrop);
+
     // Tool shortcut events from main.js
     this._onTool = (e) => this.setTool(e.detail);
     this._onDeleteSelected = () => this._deleteSelected();
@@ -102,6 +112,9 @@ export class Timeline {
       bubbles: true, detail: { pts },
     }));
   }
+
+  /** Provide the FrameServerPool so drop can look up clip durations */
+  setPool(pool) { this._pool = pool; }
 
   setTool(name) {
     this._tool = name;
@@ -123,6 +136,9 @@ export class Timeline {
     this._canvas.removeEventListener('mousemove', this._onMouseMove);
     this._canvas.removeEventListener('mouseup',   this._onMouseUp);
     this._canvas.removeEventListener('dblclick',  this._onDblClick);
+    this._canvas.removeEventListener('dragover',  this._onDragOver);
+    this._canvas.removeEventListener('dragleave', this._onDragLeave);
+    this._canvas.removeEventListener('drop',      this._onDrop);
     window.removeEventListener('nle:tool',            this._onTool);
     window.removeEventListener('nle:delete-selected', this._onDeleteSelected);
   }
@@ -230,6 +246,7 @@ export class Timeline {
     }
     this._drawHeader(ctx, seq, h);
     this._drawPlayhead(ctx, h);
+    if (this._dropHint) this._drawDropHint(ctx, h);
 
     ctx.restore();
   }
@@ -269,10 +286,17 @@ export class Timeline {
       ctx.lineTo(x + 0.5, RULER_H);
       ctx.stroke();
 
-      // Label every other tick if they're crowded
       const label = _formatRulerTime(t, fps);
       ctx.fillText(label, x + 3, RULER_H / 2);
     }
+
+    // FPS badge at right edge of ruler
+    const fpsLabel = _formatFpsLabel(this._fps_num, this._fps_den);
+    ctx.font      = '9px -apple-system, sans-serif';
+    ctx.fillStyle = '#444';
+    ctx.textAlign = 'right';
+    ctx.fillText(fpsLabel, w - 6, RULER_H / 2);
+    ctx.textAlign = 'left';
   }
 
   _drawTracks(ctx, seq, w, h) {
@@ -416,12 +440,79 @@ export class Timeline {
     ctx.fill();
   }
 
+  _drawDropHint(ctx, h) {
+    const { mx, trackIdx } = this._dropHint;
+    const x = mx;
+    // Vertical drop line
+    ctx.save();
+    ctx.strokeStyle = 'rgba(79,143,255,0.9)';
+    ctx.lineWidth   = 2;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x, RULER_H);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // Track highlight
+    if (trackIdx >= 0) {
+      const ty = this._trackY(trackIdx);
+      ctx.fillStyle = 'rgba(79,143,255,0.1)';
+      ctx.fillRect(HEADER_W, ty, this._W - HEADER_W, TRACK_H);
+    }
+    ctx.restore();
+  }
+
   _drawEmptyHint(ctx, w, h) {
     ctx.fillStyle   = '#333';
     ctx.font        = '13px -apple-system, sans-serif';
     ctx.textAlign   = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText('Add clips from the Media Bin', (w + HEADER_W) / 2, h / 2);
+  }
+
+  // ── Drag-and-drop (clips from Media Bin) ─────────────────────────────
+
+  _onDragOver(e) {
+    if (!e.dataTransfer.types.includes('application/nle-clips')) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+
+    // Draw a drop indicator line at current cursor position
+    const rect    = this._canvas.getBoundingClientRect();
+    const mx      = e.clientX - rect.left;
+    const trackIdx = this._yToTrackIdx(e.clientY - rect.top);
+    this._dropHint = { mx, trackIdx };
+    this._draw();
+  }
+
+  _onDragLeave() {
+    this._dropHint = null;
+    this._draw();
+  }
+
+  _onDrop(e) {
+    this._dropHint = null;
+    if (!e.dataTransfer.types.includes('application/nle-clips')) return;
+    e.preventDefault();
+
+    let paths;
+    try { paths = JSON.parse(e.dataTransfer.getData('application/nle-clips')); }
+    catch { return; }
+    if (!Array.isArray(paths) || paths.length === 0) return;
+
+    const rect     = this._canvas.getBoundingClientRect();
+    const mx       = e.clientX - rect.left;
+    const my       = e.clientY - rect.top;
+    const trackIdx = Math.max(0, this._yToTrackIdx(my) >= 0 ? this._yToTrackIdx(my) : 0);
+    const dropPts  = Math.max(0, this._snap(this._xToPts(mx)));
+
+    // Fire event so main.js can call add_clip (it owns the sequence state)
+    this._canvas.dispatchEvent(new CustomEvent('nle:drop-clips', {
+      bubbles: true,
+      detail: { paths, trackIndex: trackIdx, dropPts },
+    }));
+
+    this._draw();
   }
 
   // ── Mouse events ────────────────────────────────────────────────────────
@@ -663,6 +754,15 @@ function _lighten(hex, amount) {
   const g = Math.min(255, ((n >> 8)  & 0xff) + Math.round(255 * amount));
   const b = Math.min(255, ( n        & 0xff) + Math.round(255 * amount));
   return '#' + [r, g, b].map((c) => c.toString(16).padStart(2, '0')).join('');
+}
+
+function _formatFpsLabel(num, den) {
+  if (!den || den === 1) return `${num}fps`;
+  const val = num / den;
+  if (Math.abs(val - 23.976) < 0.01) return '23.976fps';
+  if (Math.abs(val - 29.97)  < 0.01) return '29.97fps';
+  if (Math.abs(val - 59.94)  < 0.01) return '59.94fps';
+  return val.toFixed(2).replace(/\.?0+$/, '') + 'fps';
 }
 
 function _formatRulerTime(sec, fps) {

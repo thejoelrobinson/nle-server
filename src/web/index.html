@@ -54,7 +54,8 @@
     <div id="program-monitor" class="panel">
       <div class="panel-header">
         <span class="panel-title">Program</span>
-        <span class="panel-badge" id="program-seq-name"></span>
+        <span class="panel-badge" id="program-seq-name">Sequence 01</span>
+        <span class="panel-badge program-seq-meta" id="program-seq-meta">1920×1080 · 24fps</span>
       </div>
       <div class="monitor-viewport">
         <canvas id="gl-canvas"></canvas>
@@ -92,6 +93,7 @@
       <div class="panel-header">
         <span class="panel-title">Media Bin</span>
         <div class="panel-actions">
+          <button class="btn-sm btn-primary" id="btn-new-sequence" title="New Sequence">+ Sequence</button>
           <button class="btn-sm" id="btn-import">Import…</button>
           <button class="btn-sm" id="btn-save-project"  title="Save project (⌘S)">Save</button>
           <button class="btn-sm" id="btn-load-project"  title="Load project">Load</button>

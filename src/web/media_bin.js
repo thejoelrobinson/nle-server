@@ -3,9 +3,11 @@
  *
  * Handles:
  *  - Import button (File System Access API + <input> fallback)
- *  - Drag-and-drop onto the Media Bin panel
- *  - Clip list rendering with thumbnail icon, name, duration
- *  - Double-click / single-click → load clip into Source Monitor
+ *  - Drag-and-drop onto the Media Bin panel (file import from OS)
+ *  - Clip list rendering with codec badge, resolution badge, duration
+ *  - Multi-select: click = single, Cmd/Ctrl+click = toggle, Shift+click = range
+ *  - Dragging selected clips to timeline (sets dataTransfer 'application/nle-clips')
+ *  - Double-click → load clip into Source Monitor
  *  - I/O point marking (keys I / O)
  *  - Insert / Overwrite buttons → emits 'nle:insert-clip'
  *  - Source Monitor playback (via FrameServerPool from window._nle.pool)
@@ -13,7 +15,6 @@
  * Integration:
  *  Reads  window._nle.pool, window._nle.importFileToTimeline
  *  Emits  CustomEvent 'nle:insert-clip'  { file, trackIndex, inPts, outPts }
- *         CustomEvent 'nle:open-in-program'  (drag-drop handled by main.js)
  */
 
 import { Player }         from './player.js';
@@ -41,8 +42,11 @@ export function initMediaBin() {
   const btnOverwrite  = document.getElementById('source-btn-overwrite');
 
   // ── State ──────────────────────────────────────────────────────────────
-  const clips      = [];  // [{ file, duration, fps, inPts, outPts }]
-  let   activeIdx  = -1;  // index of clip in Source Monitor
+  const clips           = [];   // [{ file, duration, fps, width, height, codec, inPts, outPts }]
+  let   activeIdx       = -1;   // index of clip open in Source Monitor
+  const selectedIndices = new Set();  // multi-select
+  let   lastClickIdx    = -1;   // for shift-range anchor
+
   let   srcPlayer  = null;
   let   srcPts     = 0;   // current source pts in seconds
   let   srcDur     = 0;
@@ -105,7 +109,6 @@ export function initMediaBin() {
     const { pool } = window._nle ?? {};
     if (!pool) return;
 
-    // Ensure file is loaded into pool
     if (!pool.has(clip.file.name)) {
       try { await pool.addFile(clip.file); } catch { return; }
     }
@@ -118,20 +121,40 @@ export function initMediaBin() {
     srcInPts  = 0;
     srcOutPts = clip.duration;
 
-    if (sourceEmpty)   sourceEmpty.classList.add('hidden');
+    if (sourceEmpty)    sourceEmpty.classList.add('hidden');
     if (sourceClipName) sourceClipName.textContent = clip.file.name;
-    if (sourceDur)  sourceDur.textContent  = formatTimecode(srcDur, srcFps);
-    if (sourceTc)   sourceTc.textContent   = formatTimecode(0, srcFps);
+    if (sourceDur)      sourceDur.textContent  = formatTimecode(srcDur, srcFps);
+    if (sourceTc)       sourceTc.textContent   = formatTimecode(0, srcFps);
 
     [btnSrcPlay, btnSrcBack, btnSrcFwd, btnSrcMarkIn, btnSrcMarkOut, btnInsert, btnOverwrite]
       .forEach((b) => { if (b) b.disabled = false; });
 
-    // Update visual selection in bin
-    document.querySelectorAll('.bin-item').forEach((el, i) => {
-      el.classList.toggle('selected', i === idx);
-    });
-
+    renderBinList();
     renderSourceFrame(0);
+  }
+
+  // ── Codec + resolution badge helpers ──────────────────────────────────
+
+  function _codecLabel(codec) {
+    if (!codec) return '';
+    const s = String(codec).toLowerCase();
+    if (s.includes('h264') || s === '27')                    return 'H.264';
+    if (s.includes('hevc') || s.includes('h265') || s === '173') return 'HEVC';
+    if (s.includes('prores') || s === '147')                 return 'ProRes';
+    if (s.includes('mpeg2') || s === '2')                    return 'MPEG2';
+    if (s.includes('vp9')   || s === '167')                  return 'VP9';
+    if (s.includes('av1')   || s === '226')                  return 'AV1';
+    if (s.includes('dnxhd') || s === '99')                   return 'DNxHD';
+    return '';
+  }
+
+  function _resLabel(w, h) {
+    if (!w || !h) return '';
+    if (h >= 2160) return '4K';
+    if (h >= 1080) return '1080p';
+    if (h >= 720)  return '720p';
+    if (h >= 480)  return '480p';
+    return `${w}×${h}`;
   }
 
   // ── Clip list rendering ────────────────────────────────────────────────
@@ -145,22 +168,102 @@ export function initMediaBin() {
     }
     if (binEmptyMsg) binEmptyMsg.style.display = 'none';
 
-    // Rebuild only changed items (simple full rebuild for now)
     binList.innerHTML = '';
+
+    // Selection count badge (shown when 2+ are selected)
+    if (selectedIndices.size > 1) {
+      const badge = document.createElement('div');
+      badge.className = 'bin-selection-badge';
+      badge.textContent = `${selectedIndices.size} clips selected`;
+      binList.appendChild(badge);
+    }
+
     clips.forEach((clip, idx) => {
+      const isActive   = idx === activeIdx;
+      const isSelected = selectedIndices.has(idx);
+      const codec      = _codecLabel(clip.codec);
+      const res        = _resLabel(clip.width, clip.height);
+      const dur        = formatTimecode(clip.duration, clip.fps);
+
       const item = document.createElement('div');
-      item.className = 'bin-item' + (idx === activeIdx ? ' selected' : '');
+      item.className = 'bin-item'
+        + (isActive   ? ' active-source' : '')
+        + (isSelected ? ' selected'      : '');
       item.dataset.idx  = idx;
       item.dataset.path = clip.file.name;
+      item.draggable    = true;
+
+      const badgesHtml = [
+        codec ? `<span class="bin-badge bin-badge-codec">${_esc(codec)}</span>` : '',
+        res   ? `<span class="bin-badge bin-badge-res">${_esc(res)}</span>`     : '',
+      ].join('');
+
       item.innerHTML = `
         <div class="bin-item-icon">▶</div>
         <div class="bin-item-info">
           <div class="bin-item-name" title="${_esc(clip.file.name)}">${_esc(clip.file.name)}</div>
-          <div class="bin-item-meta">${formatTimecode(clip.duration, clip.fps)}  ${clip.fps.toFixed(2)} fps  ${clip.width}×${clip.height}</div>
+          <div class="bin-item-meta">${badgesHtml}<span class="bin-item-dur">${_esc(dur)}</span></div>
           <div class="proxy-status"></div>
         </div>`;
-      item.addEventListener('click',    () => openInSource(idx));
-      item.addEventListener('dblclick', () => openInSource(idx));
+
+      // ── Click: single / toggle / range ──────────────────────────────
+      item.addEventListener('click', (e) => {
+        if (e.shiftKey && lastClickIdx >= 0) {
+          const lo = Math.min(lastClickIdx, idx);
+          const hi = Math.max(lastClickIdx, idx);
+          for (let i = lo; i <= hi; i++) selectedIndices.add(i);
+        } else if (e.metaKey || e.ctrlKey) {
+          if (selectedIndices.has(idx)) selectedIndices.delete(idx);
+          else selectedIndices.add(idx);
+          lastClickIdx = idx;
+        } else {
+          selectedIndices.clear();
+          selectedIndices.add(idx);
+          lastClickIdx = idx;
+        }
+        renderBinList();
+      });
+
+      // ── Double-click: open in source monitor ─────────────────────────
+      item.addEventListener('dblclick', (e) => {
+        e.stopPropagation();
+        selectedIndices.clear();
+        selectedIndices.add(idx);
+        lastClickIdx = idx;
+        openInSource(idx);
+      });
+
+      // ── Drag start: carry all selected paths ─────────────────────────
+      item.addEventListener('dragstart', (e) => {
+        // If the dragged item isn't selected, replace selection with just it
+        if (!selectedIndices.has(idx)) {
+          selectedIndices.clear();
+          selectedIndices.add(idx);
+          lastClickIdx = idx;
+          renderBinList();
+        }
+
+        const paths = Array.from(selectedIndices).map((i) => clips[i].file.name);
+        e.dataTransfer.setData('application/nle-clips', JSON.stringify(paths));
+        e.dataTransfer.effectAllowed = 'copy';
+
+        // Custom drag ghost
+        const ghost = document.createElement('div');
+        ghost.textContent = paths.length === 1
+          ? clips[Array.from(selectedIndices)[0]].file.name.split(/[\\/]/).pop()
+          : `${paths.length} clips`;
+        Object.assign(ghost.style, {
+          position: 'fixed', top: '-100px', left: '0',
+          background: '#1e6e8e', color: '#fff',
+          padding: '4px 10px', borderRadius: '4px',
+          fontSize: '11px', pointerEvents: 'none', whiteSpace: 'nowrap',
+          zIndex: '9999',
+        });
+        document.body.appendChild(ghost);
+        e.dataTransfer.setDragImage(ghost, 20, 12);
+        setTimeout(() => document.body.removeChild(ghost), 0);
+      });
+
       binList.appendChild(item);
     });
   }
@@ -171,7 +274,6 @@ export function initMediaBin() {
     const { pool } = window._nle ?? {};
     if (!pool) return;
 
-    // Wire up proxy progress display once (idempotent)
     pool.onProxyProgress = (path, cur, total) => {
       const pct = total > 0 ? Math.round((cur / total) * 100) : 0;
       const el  = document.querySelector(
@@ -185,12 +287,21 @@ export function initMediaBin() {
       try {
         await pool.addFile(file);
         const bridge = pool.getBridge(file.name);
+
+        // Try to get codec info
+        let codec = '';
+        try {
+          const info = pool.getInfo?.(file.name);
+          codec = info?.codec_name ?? info?.codec_id ?? '';
+        } catch { /* best-effort */ }
+
         clips.push({
           file,
           duration: bridge?.duration ?? 0,
           fps:      bridge?.fps      ?? 24,
           width:    bridge?._width   ?? 1920,
           height:   bridge?._height  ?? 1080,
+          codec,
           inPts:    0,
           outPts:   bridge?.duration ?? 0,
         });
@@ -226,19 +337,23 @@ export function initMediaBin() {
     });
   }
 
-  // ── Drag-and-drop onto Media Bin ──────────────────────────────────────
+  // ── Drag-and-drop onto Media Bin (OS file import only) ────────────────
 
   if (binPanel) {
     binPanel.addEventListener('dragover', (e) => {
-      e.preventDefault();
-      const overlay = document.getElementById('bin-drop-overlay');
-      if (overlay) overlay.style.display = 'flex';
+      // Only accept external file drags, not internal clip-to-timeline drags
+      if (!e.dataTransfer.types.includes('application/nle-clips')) {
+        e.preventDefault();
+        const overlay = document.getElementById('bin-drop-overlay');
+        if (overlay) overlay.style.display = 'flex';
+      }
     });
     binPanel.addEventListener('dragleave', () => {
       const overlay = document.getElementById('bin-drop-overlay');
       if (overlay) overlay.style.display = 'none';
     });
     binPanel.addEventListener('drop', async (e) => {
+      if (e.dataTransfer.types.includes('application/nle-clips')) return;
       e.preventDefault();
       const overlay = document.getElementById('bin-drop-overlay');
       if (overlay) overlay.style.display = 'none';
@@ -252,26 +367,18 @@ export function initMediaBin() {
   if (btnSrcPlay) btnSrcPlay.addEventListener('click', () => {
     if (srcPlaying) stopSrcPlay(); else startSrcPlay();
   });
-
   if (btnSrcBack) btnSrcBack.addEventListener('click', () => {
     stopSrcPlay();
     srcPts = Math.max(0, srcPts - (srcFps > 0 ? 1 / srcFps : 1 / 24));
     renderSourceFrame(srcPts);
   });
-
   if (btnSrcFwd) btnSrcFwd.addEventListener('click', () => {
     stopSrcPlay();
     srcPts = Math.min(srcDur, srcPts + (srcFps > 0 ? 1 / srcFps : 1 / 24));
     renderSourceFrame(srcPts);
   });
-
-  if (btnSrcMarkIn) btnSrcMarkIn.addEventListener('click', () => {
-    srcInPts = srcPts;
-  });
-
-  if (btnSrcMarkOut) btnSrcMarkOut.addEventListener('click', () => {
-    srcOutPts = srcPts;
-  });
+  if (btnSrcMarkIn)  btnSrcMarkIn.addEventListener('click',  () => { srcInPts  = srcPts; });
+  if (btnSrcMarkOut) btnSrcMarkOut.addEventListener('click', () => { srcOutPts = srcPts; });
 
   // ── Insert / Overwrite ────────────────────────────────────────────────
 
@@ -292,15 +399,17 @@ export function initMediaBin() {
   if (btnInsert)    btnInsert.addEventListener('click',    () => emitInsert(false));
   if (btnOverwrite) btnOverwrite.addEventListener('click', () => emitInsert(true));
 
-  // ── Keyboard I/O shortcuts (when Source Monitor is focused) ──────────
+  // ── Keyboard I/O shortcuts ────────────────────────────────────────────
+
   document.addEventListener('keydown', (e) => {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
     if (activeIdx < 0) return;
-    if (e.code === 'KeyI') { srcInPts = srcPts; }
+    if (e.code === 'KeyI') { srcInPts  = srcPts; }
     if (e.code === 'KeyO') { srcOutPts = srcPts; }
   });
 
   // ── Cross-module: show clip in source from timeline dblclick ──────────
+
   window.addEventListener('nle:show-in-source', (e) => {
     const path = e.detail?.sourcePath;
     if (!path) return;
@@ -308,13 +417,13 @@ export function initMediaBin() {
     if (idx >= 0) openInSource(idx);
   });
 
-  // ── nle:insert-clip carries I/O into main.js importFileToTimeline ─────
+  // ── nle:insert-clip → main.js importFileToTimeline ───────────────────
+
   window.addEventListener('nle:insert-clip', async (e) => {
     const { file, trackIndex, inPts, outPts } = e.detail ?? {};
     if (!file) return;
     const { importFileToTimeline } = window._nle ?? {};
     if (!importFileToTimeline) return;
-    // Pass with custom source in/out — main.js already handles add_clip
     await importFileToTimeline(file, trackIndex ?? 0, inPts ?? 0, outPts ?? null);
   });
 }
@@ -322,5 +431,7 @@ export function initMediaBin() {
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 function _esc(str) {
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(str)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
