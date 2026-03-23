@@ -235,7 +235,8 @@ export class Playback {
 
     // ── Draw from cache — zero WASM calls ─────────────────────────────────
     if (resolved?.source_path && this._player) {
-      const frame = this._cache.get(resolved.source_path, resolved.source_pts);
+      // Round source_pts to avoid floating-point key mismatches between _tick and _decodeLoop.
+      const frame = this._cache.get(resolved.source_path, Math.round(resolved.source_pts));
       if (frame) {
         // Colorspace: only look up when source file changes
         if (resolved.source_path !== this._lastResolvedSourcePath) {
@@ -303,7 +304,8 @@ export class Playback {
 
         const resolved = this._engine?.resolve_frame(this._seqId, targetPts);
         if (!resolved?.source_path) continue;
-        if (this._cache.has(resolved.source_path, resolved.source_pts)) continue;
+        const sourcePts = Math.round(resolved.source_pts);
+        if (this._cache.has(resolved.source_path, sourcePts)) continue;
 
         // decodeFrameAt is async on both the WebCodecs and WASM paths.
         const frameData = await this._pool.decodeFrameAt(
@@ -313,7 +315,7 @@ export class Playback {
         if (!frameData) continue;
 
         const cached = await _toImageBitmapIfNeeded(frameData);
-        if (cached) this._cache.set(resolved.source_path, resolved.source_pts, cached);
+        if (cached) this._cache.set(resolved.source_path, sourcePts, cached);
       }
 
       // Yield to the event loop between decode rounds so rAF callbacks
@@ -361,14 +363,15 @@ export class Playback {
         this._lastColorspace = colorspace;
       }
 
-      let frame = this._cache.get(resolved.source_path, resolved.source_pts);
+      const sourcePts = Math.round(resolved.source_pts);
+      let frame = this._cache.get(resolved.source_path, sourcePts);
       if (!frame) {
         const frameData = await this._pool.decodeFrameAt(
           resolved.source_path,
           usToSecs(resolved.source_pts)
         );
         frame = await _toImageBitmapIfNeeded(frameData);
-        if (frame) this._cache.set(resolved.source_path, resolved.source_pts, frame);
+        if (frame) this._cache.set(resolved.source_path, sourcePts, frame);
       }
 
       if (frame && this._player) {

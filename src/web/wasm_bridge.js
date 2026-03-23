@@ -313,12 +313,12 @@ export class FrameServerPool {
   // ── Long-GOP detection ────────────────────────────────────────────────────
 
   /**
-   * Returns true if the codec produces long-GOP video that benefits from
-   * a proxy.  Codec IDs are from the FFmpeg AVCodecID enum.
-   * H264=27, HEVC=173, MPEG2VIDEO=4, MPEG4=13, MPEG1VIDEO=1
+   * Returns true if the codec produces long-GOP or intra-only video that
+   * benefits from a proxy.  Codec IDs are from the FFmpeg AVCodecID enum.
+   * H264=27, HEVC=173, MPEG2VIDEO=2, MPEG4=13, MPEG1VIDEO=1, DNxHD=144, ProRes=147
    */
   static isLongGOP(codecId) {
-    return [27, 173, 4, 13, 1].includes(codecId);
+    return [27, 173, 2, 13, 1, 144, 147].includes(codecId);
   }
 
   // ── File hashing for proxy cache key ─────────────────────────────────────
@@ -384,11 +384,25 @@ export class FrameServerPool {
     const entry = { bridge, proxyBridge: null, file, info, proxyHash: null };
     this._pool.set(file.name, entry);
 
-    if (info && FrameServerPool.isLongGOP(info.codec_id)) {
+    // MXF always gets a proxy regardless of codec (MPEG-2, DNxHD, ProRes all need it).
+    const isMxf = file.name.toLowerCase().endsWith('.mxf');
+    if (info && (FrameServerPool.isLongGOP(info.codec_id) || isMxf)) {
       const hash = await FrameServerPool.hashFile(file);
       entry.proxyHash = hash;
 
-      const proxyBlob = await FrameServerPool._loadProxy(hash);
+      // 5-second timeout on IDB lookup — a hung IDB should not block proxy generation.
+      let proxyBlob = null;
+      try {
+        proxyBlob = await Promise.race([
+          FrameServerPool._loadProxy(hash),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('IDB timeout')), 5000)),
+        ]);
+      } catch (err) {
+        if (err.message !== 'IDB timeout') {
+          console.warn('[FrameServerPool] IDB lookup error:', err); // eslint-disable-line no-console
+        }
+        proxyBlob = null;
+      }
       if (proxyBlob) {
         // Proxy already in cache — open it immediately
         try {
