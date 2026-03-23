@@ -193,6 +193,8 @@ export class Playback {
     this._lastResolvedSourcePath = null;  // invalidate colorspace cache on seek
     this._updateTimelineDisplay(pts);
     this._onTimecode?.(pts);
+    // _decodeAndDisplay is async; fire-and-forget is fine — the frame draws
+    // when ready and the UI stays responsive throughout.
     this._decodeAndDisplay(pts);
   }
 
@@ -279,13 +281,18 @@ export class Playback {
    * every 4 ms via setTimeout so the main thread stays unblocked between
    * rAF callbacks.
    *
+   * When the hardware WebCodecs path is active, decodeFrameAt() returns
+   * { videoFrame, width, height }.  We convert VideoFrame → ImageBitmap here
+   * so the rAF tick can draw it synchronously from cache without holding an
+   * open VideoFrame reference.
+   *
    * The loop terminates as soon as _isPlaying becomes false.
    */
   async _decodeLoop() {
     const lookahead = 5;
 
     while (this._isPlaying) {
-      const pts          = this._playheadPts;
+      const pts           = this._playheadPts;
       const frameDuration = frameDurationUs(this._fps);
 
       for (let i = 0; i <= lookahead; i++) {
@@ -298,11 +305,15 @@ export class Playback {
         if (!resolved?.source_path) continue;
         if (this._cache.has(resolved.source_path, resolved.source_pts)) continue;
 
-        const frame = this._pool.decodeFrameAt(
+        // decodeFrameAt is async on both the WebCodecs and WASM paths.
+        const frameData = await this._pool.decodeFrameAt(
           resolved.source_path,
           usToSecs(resolved.source_pts)
         );
-        if (frame) this._cache.set(resolved.source_path, resolved.source_pts, frame);
+        if (!frameData) continue;
+
+        const cached = await _toImageBitmapIfNeeded(frameData);
+        if (cached) this._cache.set(resolved.source_path, resolved.source_pts, cached);
       }
 
       // Yield to the event loop between decode rounds so rAF callbacks
@@ -330,9 +341,9 @@ export class Playback {
     } catch (_e) { /* non-fatal — video keeps playing */ }
   }
 
-  // ── Synchronous decode used only for scrub / step (not in rAF) ───────────
+  // ── Async decode used for scrub / step (not in rAF) ─────────────────────
 
-  _decodeAndDisplay(pts, resolved = null) {
+  async _decodeAndDisplay(pts, resolved = null) {
     if (!this._pool) return;
     try {
       if (!resolved) {
@@ -352,7 +363,11 @@ export class Playback {
 
       let frame = this._cache.get(resolved.source_path, resolved.source_pts);
       if (!frame) {
-        frame = this._pool.decodeFrameAt(resolved.source_path, usToSecs(resolved.source_pts));
+        const frameData = await this._pool.decodeFrameAt(
+          resolved.source_path,
+          usToSecs(resolved.source_pts)
+        );
+        frame = await _toImageBitmapIfNeeded(frameData);
         if (frame) this._cache.set(resolved.source_path, resolved.source_pts, frame);
       }
 
@@ -363,5 +378,31 @@ export class Playback {
     } catch (e) {
       console.warn('[Playback] decode error:', e); // eslint-disable-line no-console
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Module-level helper
+// ---------------------------------------------------------------------------
+
+/**
+ * If frameData is a WebCodecs result ({ videoFrame, width, height }), convert
+ * the VideoFrame to an ImageBitmap (closes the VideoFrame to free GPU memory)
+ * and return { bitmap, width, height } suitable for Player._drawBitmap().
+ *
+ * If frameData is already a plain YUV frame object, return it unchanged.
+ *
+ * @param {object|null} frameData
+ * @returns {Promise<object|null>}
+ */
+async function _toImageBitmapIfNeeded(frameData) {
+  if (!frameData?.videoFrame) return frameData;   // YUV path — no conversion needed
+  const { videoFrame, width, height } = frameData;
+  try {
+    const bitmap = await createImageBitmap(videoFrame);
+    return { bitmap, width, height };
+  } finally {
+    // Always free the VideoFrame regardless of whether createImageBitmap succeeded.
+    videoFrame.close();
   }
 }

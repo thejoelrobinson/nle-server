@@ -50,6 +50,21 @@ public:
     emscripten::val decode_frame_at(double target_seconds);
 
     /**
+     * Return the codec extradata (SPS/PPS for H.264, VPS/SPS/PPS for HEVC, etc.)
+     * as a JS Uint8Array, or null if unavailable.
+     * Used by the WebCodecs path to configure VideoDecoder.
+     */
+    emscripten::val get_extradata();
+
+    /**
+     * Demux the encoded packet closest to target_seconds and return it as a JS
+     * object { data: Uint8Array, timestamp: number (µs), is_keyframe: bool }.
+     * Does NOT decode — WebCodecs VideoDecoder performs the actual decode.
+     * Returns null if the seek or read fails.
+     */
+    emscripten::val get_encoded_packet_at(double target_seconds);
+
+    /**
      * Generate an MJPEG proxy file for the currently open video.
      * Every frame is encoded as a JPEG keyframe, enabling O(1) per-frame seek.
      * target_width / target_height must be even numbers.

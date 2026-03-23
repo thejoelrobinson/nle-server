@@ -14,6 +14,8 @@
  * the module graph.  Different base names eliminate the collision permanently.
  */
 
+import { WebCodecsDecoder } from './webcodecs_decoder.js';
+
 // Emscripten artifacts are in build/wasm/, served by Vite's publicDir at /wasm/.
 // We load via fetch() + blob URL rather than dynamic import() to keep this file
 // out of Vite's module resolver path for that URL.
@@ -30,6 +32,9 @@ export class FrameServerBridge {
     this._duration = 0;
     this._width    = 0;
     this._height   = 0;
+
+    // WebCodecs hardware decoder (null = WASM fallback)
+    this._webcodecs = null;
 
     // Callbacks (all optional — default to noops)
     this._onFrame    = onFrame    ?? (() => {});
@@ -144,32 +149,86 @@ export class FrameServerBridge {
       duration:   this._duration,
       frameCount,
     });
+
+    // Attempt to wire up a hardware WebCodecs decoder.  Non-fatal on failure.
+    await this._initWebCodecs();
+  }
+
+  // ── WebCodecs hardware-decode path ───────────────────────────────────────
+
+  async _initWebCodecs() {
+    this._webcodecs = null;   // reset on each open()
+    if (!WebCodecsDecoder.isSupported()) return;
+
+    const info = this._server.get_stream_info();
+    if (!info) return;
+
+    const codecStr = WebCodecsDecoder.codecStringFromId(info.codec_id);
+    if (!codecStr) return;
+
+    const supported = await WebCodecsDecoder.isCodecSupported(codecStr);
+    if (!supported) return;
+
+    const extradata = this._server.get_extradata();   // Uint8Array or null
+
+    const decoder = new WebCodecsDecoder();
+    try {
+      await decoder.init({
+        codec:        codecStr,
+        codedWidth:   info.width,
+        codedHeight:  info.height,
+        description:  extradata ?? undefined,
+      });
+      this._webcodecs = decoder;
+      console.log(`[Bridge] WebCodecs active for codec ${codecStr} (hardware)`); // eslint-disable-line no-console
+    } catch (e) {
+      console.warn('[Bridge] WebCodecs init failed, falling back to WASM:', e); // eslint-disable-line no-console
+      decoder.destroy();
+    }
+  }
+
+  async _decodeFrameWebCodecs(targetSecs) {
+    const pktData = this._server.get_encoded_packet_at(targetSecs);
+    if (!pktData) return null;
+
+    const videoFrame = await this._webcodecs.decodeChunk({
+      data:      pktData.data,
+      timestamp: pktData.timestamp,
+      type:      pktData.is_keyframe ? 'key' : 'delta',
+    });
+    if (!videoFrame) return null;
+
+    // Return a thin wrapper; caller converts to ImageBitmap before caching.
+    return { videoFrame, width: videoFrame.codedWidth, height: videoFrame.codedHeight };
   }
 
   /**
    * Seek to a position (seconds) and decode the exact frame at that position.
-   * Uses decode_frame_at() which seeks to the preceding keyframe, flushes the
-   * codec, then decodes forward until reaching the target PTS — giving accurate
-   * frame-level seek for long-GOP codecs like MPEG-2.
+   * Uses the WebCodecs hardware path when available, WASM otherwise.
+   * Fires the onFrame callback when the frame is ready.
    * @param {number} seconds
    */
-  seekTo(seconds) {
+  async seekTo(seconds) {
     if (!this._server) return;
     this._pts = Math.max(0, Math.min(seconds, this._duration));
-    const frame = this._server.decode_frame_at(this._pts);
+    const frame = await this.decodeFrameAt(this._pts);
     if (frame) this._onFrame(frame, this._pts);
   }
 
   /**
    * Decode and return the frame at `seconds` without firing onFrame callback.
-   * Used by FrameServerPool to decode a specific source clip frame for the
-   * Program Monitor's timeline playback.
+   * Returns { videoFrame, width, height } on the hardware path (caller must
+   * convert to ImageBitmap and close the VideoFrame), or a YUV frame object
+   * on the WASM path.
    * @param {number} seconds
-   * @returns {object|null} YUV frame object, or null on error
+   * @returns {Promise<object|null>}
    */
-  decodeFrameAt(seconds) {
+  async decodeFrameAt(seconds) {
     if (!this._server) return null;
     this._pts = Math.max(0, seconds);
+    if (this._webcodecs?.ready) {
+      return this._decodeFrameWebCodecs(this._pts);
+    }
     return this._server.decode_frame_at(this._pts) || null;
   }
 
@@ -224,6 +283,8 @@ export class FrameServerBridge {
   // ── Cleanup ───────────────────────────────────────────────────────────────
 
   destroy() {
+    this._webcodecs?.destroy();
+    this._webcodecs = null;
     if (this._server) { this._server.close(); this._server.delete(); this._server = null; }
   }
 }
@@ -421,13 +482,15 @@ export class FrameServerPool {
   /**
    * Decode the frame at `seconds` from the given source.
    * Uses the proxy bridge when available (and useProxy is true).
-   * Returns the YUV frame object, or null if source is not loaded.
+   * On the WebCodecs hardware path returns { videoFrame, width, height };
+   * on the WASM path returns a YUV frame object.
+   * Returns null if the source is not loaded.
    * @param {string} sourcePath
    * @param {number} seconds
    * @param {boolean} [useProxy=true]
-   * @returns {object|null}
+   * @returns {Promise<object|null>}
    */
-  decodeFrameAt(sourcePath, seconds, useProxy = true) {
+  async decodeFrameAt(sourcePath, seconds, useProxy = true) {
     const entry = this._pool.get(sourcePath);
     if (!entry) return null;
     const bridge = (useProxy && entry.proxyBridge) ? entry.proxyBridge : entry.bridge;

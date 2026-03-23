@@ -17,6 +17,17 @@ void main() {
 }
 `;
 
+// Pass-through fragment shader for pre-decoded RGBA frames (WebCodecs / ImageBitmap path).
+// The GPU already performed YUV→RGB during hardware decode; we just sample the texture.
+const FRAG_SRC_RGBA = `
+precision mediump float;
+uniform sampler2D uTex;
+varying   vec2 vTexCoord;
+void main() {
+  gl_FragColor = texture2D(uTex, vTexCoord);
+}
+`;
+
 const FRAG_SRC = `
 precision mediump float;
 uniform sampler2D uTexY;
@@ -92,7 +103,8 @@ export class Player {
     // Track whether textures have been allocated so we can use texSubImage2D
     // (no GPU realloc) for subsequent same-size uploads.  Saves ~3 × 8 MB of
     // driver-side reallocation every frame for 4K sources.
-    this._textureInitialized = false;
+    this._textureInitialized     = false;
+    this._rgbaTextureInitialized = false;
 
     this._initGL();
   }
@@ -139,6 +151,13 @@ export class Player {
     this.textureY = this._createTexture();
     this.textureU = this._createTexture();
     this.textureV = this._createTexture();
+
+    // ── RGBA pass-through program (WebCodecs / ImageBitmap path) ─────────
+    this.progRgba      = createProgram(gl, VERT_SRC, FRAG_SRC_RGBA);
+    this.locRgba_pos   = gl.getAttribLocation (this.progRgba, 'a_pos');
+    this.locRgba_uv    = gl.getAttribLocation (this.progRgba, 'a_uv');
+    this.locRgba_tex   = gl.getUniformLocation(this.progRgba, 'uTex');
+    this.textureRgba   = this._createTexture();
 
     // Without UNPACK_ALIGNMENT=1, WebGL pads each row to a 4-byte boundary.
     // For odd-width chroma planes (e.g. 1920-wide U/V at 4K) that causes
@@ -200,10 +219,69 @@ export class Player {
   }
 
   /**
+   * Draw a frame.  Accepts either:
+   *   - YUV path: { y, u, v, width, height, strideY, strideU, strideV, colorspace }
+   *   - Bitmap path: { bitmap, width, height } — ImageBitmap from WebCodecs hardware decode
+   * @param {object} frameData
+   */
+  drawFrame(frameData) {
+    if (frameData?.bitmap) {
+      this._drawBitmap(frameData.bitmap, frameData.width, frameData.height);
+      return;
+    }
+    this._drawYUV(frameData);
+  }
+
+  /**
+   * Draw a pre-decoded RGBA ImageBitmap via the pass-through WebGL program.
+   * Uses texSubImage2D for same-size frames (no GPU realloc).
+   * @param {ImageBitmap} bitmap
+   * @param {number} width
+   * @param {number} height
+   */
+  _drawBitmap(bitmap, width, height) {
+    const gl = this.gl;
+
+    if (this.canvas.width !== width || this.canvas.height !== height) {
+      this.canvas.width  = width;
+      this.canvas.height = height;
+      gl.viewport(0, 0, width, height);
+      this.width  = width;
+      this.height = height;
+      this._rgbaTextureInitialized = false;
+      this._textureInitialized     = false;   // YUV textures now wrong size too
+    }
+
+    gl.bindTexture(gl.TEXTURE_2D, this.textureRgba);
+    if (this._rgbaTextureInitialized) {
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+    } else {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+      this._rgbaTextureInitialized = true;
+    }
+
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(this.progRgba);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
+    const stride = 4 * 4;
+    gl.enableVertexAttribArray(this.locRgba_pos);
+    gl.vertexAttribPointer(this.locRgba_pos, 2, gl.FLOAT, false, stride, 0);
+    gl.enableVertexAttribArray(this.locRgba_uv);
+    gl.vertexAttribPointer(this.locRgba_uv,  2, gl.FLOAT, false, stride, 8);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.textureRgba);
+    gl.uniform1i(this.locRgba_tex, 0);
+
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  /**
    * Upload a YUV420P frame and draw it.
    * @param {{ y, u, v, width, height, strideY, strideU, strideV, colorspace }} frame
    */
-  drawFrame({ y, u, v, width, height, strideY, strideU, strideV, colorspace = 0 }) {
+  _drawYUV({ y, u, v, width, height, strideY, strideU, strideV, colorspace = 0 }) {
     const gl = this.gl;
 
     // Resize canvas backing store if dimensions changed.
@@ -215,7 +293,8 @@ export class Player {
       gl.viewport(0, 0, width, height);
       this.width  = width;
       this.height = height;
-      this._textureInitialized = false;
+      this._textureInitialized     = false;
+      this._rgbaTextureInitialized = false;   // RGBA texture now wrong size too
     }
 
     // Upload the three planes.  Use texSubImage2D (no GPU realloc) for
@@ -262,7 +341,9 @@ export class Player {
     gl.deleteTexture(this.textureY);
     gl.deleteTexture(this.textureU);
     gl.deleteTexture(this.textureV);
+    gl.deleteTexture(this.textureRgba);
     gl.deleteBuffer(this.vbo);
     gl.deleteProgram(this.prog);
+    gl.deleteProgram(this.progRgba);
   }
 }

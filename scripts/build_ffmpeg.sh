@@ -133,8 +133,8 @@ emconfigure ./configure \
     --enable-parser=aac \
     --enable-parser=mp3 \
     \
-    --extra-cflags="-O3" \
-    --extra-cxxflags="-O3"
+    --extra-cflags="-O3 -msimd128" \
+    --extra-cxxflags="-O3 -msimd128"
 
 # ── Build & install ──────────────────────────────────────────────────────────
 CPU_COUNT=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)

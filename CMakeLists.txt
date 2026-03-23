@@ -33,6 +33,11 @@ target_include_directories(frame_server PRIVATE
     ${FFMPEG_INCLUDE_DIR}
 )
 
+# SIMD + full optimisation for the frame_server compile units.
+# -msimd128 enables WebAssembly SIMD (128-bit); gives ~1.5–2× on the WASM
+# fallback path for codecs without WebCodecs support (ProRes, MPEG-2, etc.).
+target_compile_options(frame_server PRIVATE -O3 -msimd128)
+
 # ── FFmpeg static libraries (order matters for linker) ──────────────────────
 target_link_libraries(frame_server PRIVATE
     ${FFMPEG_LIB_DIR}/libavformat.a
@@ -56,6 +61,8 @@ set(EM_LINK_FLAGS
     "--bind"                       # Embind
     "-s ASSERTIONS=0"
     "-O3"
+    "-msimd128"                    # WebAssembly SIMD (128-bit)
+    "--js-opts 1"                  # Enable JS optimiser passes
 )
 
 # CMake requires a single string for link options

@@ -24,6 +24,8 @@ EMSCRIPTEN_BINDINGS(nle_frame_server) {
         .function("get_stream_info",             &FrameServer::get_stream_info)
         .function("has_audio",                   &FrameServer::has_audio)
         .function("decode_audio_at",             &FrameServer::decode_audio_at)
+        .function("get_extradata",               &FrameServer::get_extradata)
+        .function("get_encoded_packet_at",       &FrameServer::get_encoded_packet_at)
         .function("generate_proxy",              &FrameServer::generate_proxy)
         .function("set_proxy_progress_callback", &FrameServer::set_proxy_progress_callback)
         .function("close",                       &FrameServer::close)

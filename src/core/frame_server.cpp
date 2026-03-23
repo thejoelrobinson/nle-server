@@ -518,6 +518,77 @@ void FrameServer::close() {
 }
 
 // ---------------------------------------------------------------------------
+// WebCodecs demux helpers
+// ---------------------------------------------------------------------------
+
+emscripten::val FrameServer::get_extradata() {
+    if (!fmt_ctx_ || video_stream_idx_ < 0) return emscripten::val::null();
+    AVCodecParameters* par = fmt_ctx_->streams[video_stream_idx_]->codecpar;
+    if (!par->extradata || par->extradata_size <= 0) return emscripten::val::null();
+
+    // Use typed_memory_view for a single bulk copy rather than per-byte set().
+    emscripten::val arr  = emscripten::val::global("Uint8Array").new_(par->extradata_size);
+    emscripten::val view = emscripten::val(
+        emscripten::typed_memory_view(static_cast<size_t>(par->extradata_size), par->extradata)
+    );
+    arr.call<void>("set", view);
+    return arr;
+}
+
+emscripten::val FrameServer::get_encoded_packet_at(double target_seconds) {
+    if (!fmt_ctx_ || video_stream_idx_ < 0) return emscripten::val::null();
+
+    // Seek to the keyframe at or before target_seconds.
+    int64_t seek_ts = static_cast<int64_t>(target_seconds * AV_TIME_BASE);
+    int ret = av_seek_frame(fmt_ctx_, -1, seek_ts, AVSEEK_FLAG_BACKWARD);
+    if (ret < 0) return emscripten::val::null();
+
+    // Flush the decoder so any subsequent WASM decode path starts clean.
+    if (codec_ctx_) avcodec_flush_buffers(codec_ctx_);
+
+    AVStream*    s         = fmt_ctx_->streams[video_stream_idx_];
+    const double tb        = av_q2d(s->time_base);
+    const double tolerance = 0.001;   // 1 ms — handles floating-point jitter
+
+    emscripten::val result = emscripten::val::null();
+
+    // Read forward until we reach a video packet at or past the target PTS.
+    while (av_read_frame(fmt_ctx_, packet_) >= 0) {
+        if (packet_->stream_index != video_stream_idx_) {
+            av_packet_unref(packet_);
+            continue;
+        }
+
+        const double pkt_sec = (packet_->pts != AV_NOPTS_VALUE)
+                               ? packet_->pts * tb
+                               : target_seconds;   // unknown PTS: treat as on-target
+
+        if (pkt_sec >= target_seconds - tolerance) {
+            // Bulk-copy packet bytes via typed_memory_view (no per-byte overhead).
+            emscripten::val arr  = emscripten::val::global("Uint8Array").new_(packet_->size);
+            emscripten::val view = emscripten::val(
+                emscripten::typed_memory_view(static_cast<size_t>(packet_->size), packet_->data)
+            );
+            arr.call<void>("set", view);
+
+            const double timestamp_us = (packet_->pts != AV_NOPTS_VALUE)
+                                        ? packet_->pts * tb * 1000000.0
+                                        : target_seconds * 1000000.0;
+
+            result = emscripten::val::object();
+            result.set("data",        arr);
+            result.set("timestamp",   timestamp_us);
+            result.set("is_keyframe", static_cast<bool>(packet_->flags & AV_PKT_FLAG_KEY));
+            av_packet_unref(packet_);
+            break;
+        }
+        av_packet_unref(packet_);
+    }
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // generate_proxy  –  encode every frame as MJPEG to a dynamic memory buffer
 // ---------------------------------------------------------------------------
 
