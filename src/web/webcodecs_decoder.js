@@ -113,6 +113,14 @@ export class WebCodecsDecoder {
         this._decoder.decode(chunk);
         await this._decoder.flush();
 
+        // flush() guarantees all decoded frames have been output, so
+        // _resolveFrame should already be called. If not (decoder silently
+        // dropped the frame), resolve null to prevent an eternal hang.
+        if (this._resolveFrame) {
+            this._resolveFrame(null);
+            this._resolveFrame = null;
+        }
+
         return framePromise;
     }
 
