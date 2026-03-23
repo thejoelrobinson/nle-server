@@ -240,7 +240,11 @@ async function importFileToTimeline(file, trackIndex = 0, srcInPts = 0, srcOutPt
 
 // ── Transport buttons ──────────────────────────────────────────────────────
 
-btnPlayPause.addEventListener('click', () => { playback?.toggle(); });
+btnPlayPause.addEventListener('click', () => {
+  // Ensure GL player is initialised before the first play (user-gesture context).
+  initPlayer();
+  playback?.toggle();
+});
 btnStepBack.addEventListener('click',  () => { playback?.stepBack(); });
 btnStepFwd.addEventListener('click',   () => { playback?.stepForward(); });
 

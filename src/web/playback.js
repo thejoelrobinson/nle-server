@@ -138,6 +138,9 @@ export class Playback {
 
   play() {
     if (this._isPlaying) return;
+    if (!this._player) {
+      console.warn('[Playback] play() called but _player is null — frames will not draw until setProgramPlayer() is called'); // eslint-disable-line no-console
+    }
     this._isPlaying   = true;
     this._lastFrameMs = null;
     this._tickCount   = 0;
@@ -234,11 +237,16 @@ export class Playback {
       : null;
 
     // ── Draw from cache — zero WASM calls ─────────────────────────────────
+    // Compute roundedPts and frame outside the player guard so the diagnostic
+    // log fires every tick regardless of whether _player is set yet.
+    const roundedPts = resolved?.source_pts != null ? Math.round(resolved.source_pts) : null;
+    const frame = (resolved?.source_path && roundedPts != null)
+      ? this._cache.get(resolved.source_path, roundedPts)
+      : null;
+
+    console.log('[_tick] pts:', Math.round(this._playheadPts), '| src:', resolved?.source_path ?? 'null', '| cacheKey:', roundedPts, '| hit:', !!frame, '| hasPlayer:', !!this._player); // eslint-disable-line no-console
+
     if (resolved?.source_path && this._player) {
-      // Round source_pts to avoid floating-point key mismatches between _tick and _decodeLoop.
-      const roundedPts = Math.round(resolved.source_pts);
-      const frame = this._cache.get(resolved.source_path, roundedPts);
-      console.log('[_tick] resolved:', resolved?.source_path ?? 'null', '| cache hit:', !!frame, '| pts:', roundedPts); // eslint-disable-line no-console
       if (frame) {
         // Colorspace: only look up when source file changes
         if (resolved.source_path !== this._lastResolvedSourcePath) {
@@ -249,6 +257,8 @@ export class Playback {
         this._player.drawFrame({ ...frame, colorspace: this._lastColorspace });
         this._onFrameState?.(true);
       }
+    } else if (resolved?.source_path && !this._player) {
+      console.warn('[_tick] _player is null — call setProgramPlayer() before play()'); // eslint-disable-line no-console
     }
 
     // ── Timeline: repaint every other tick (~30 fps) ──────────────────────
