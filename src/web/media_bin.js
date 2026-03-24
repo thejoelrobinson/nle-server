@@ -285,7 +285,34 @@ export function initMediaBin() {
     for (const file of fileList) {
       if (clips.some((c) => c.file.name === file.name)) continue;
       try {
-        await pool.addFile(file);
+        // Add placeholder clip to UI immediately so user sees loading progress
+        const placeholderIdx = clips.length;
+        const escapedName = CSS.escape(file.name);
+        clips.push({
+          file,
+          duration: 0,
+          fps:      24,
+          width:    1920,
+          height:   1080,
+          codec:    '',
+          inPts:    0,
+          outPts:   0,
+        });
+        renderBinList();
+
+        // Cache element reference to avoid repeated DOM queries during import
+        let statusEl = document.querySelector(
+          `[data-path="${escapedName}"] .proxy-status`
+        );
+
+        // Show import progress
+        const importProgressCb = (bytesRead, totalBytes) => {
+          if (!statusEl) return; // Element not found (shouldn't happen but be safe)
+          const pct = totalBytes > 0 ? Math.round(Math.min(bytesRead, totalBytes) / totalBytes * 100) : 0;
+          statusEl.textContent = pct >= 100 ? 'opening…' : `reading ${pct}%`;
+        };
+
+        await pool.addFile(file, importProgressCb);
         const bridge = pool.getBridge(file.name);
 
         // Try to get codec info
@@ -295,7 +322,8 @@ export function initMediaBin() {
           codec = info?.codec_name ?? info?.codec_id ?? '';
         } catch { /* best-effort */ }
 
-        clips.push({
+        // Update placeholder with actual data
+        clips[placeholderIdx] = {
           file,
           duration: bridge?.duration ?? 0,
           fps:      bridge?.fps      ?? 24,
@@ -304,10 +332,14 @@ export function initMediaBin() {
           codec,
           inPts:    0,
           outPts:   bridge?.duration ?? 0,
-        });
-      } catch { /* skip unreadable files */ }
+        };
+        renderBinList();
+      } catch {
+        // Remove placeholder on failure
+        clips.splice(placeholderIdx, 1);
+        renderBinList();
+      }
     }
-    renderBinList();
   }
 
   // ── File System Access API / <input> ──────────────────────────────────

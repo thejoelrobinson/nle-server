@@ -68,7 +68,7 @@ void FrameServer::cleanup() {
     file_buf_.clear();
 }
 
-bool FrameServer::open(const std::string& /*filename*/, emscripten::val data) {
+bool FrameServer::open(const std::string& filename, emscripten::val data) {
     cleanup();
 
     // Copy the JS Uint8Array into our own buffer using Embind's typed_memory_view.
@@ -106,8 +106,14 @@ bool FrameServer::open(const std::string& /*filename*/, emscripten::val data) {
     if (!fmt_ctx_) return false;
     fmt_ctx_->pb = avio_ctx_;
 
+    // Force MJPEG format for proxy files to avoid low-score detection (25/100)
+    const AVInputFormat* forced_fmt = nullptr;
+    if (filename.find(".mjpeg") != std::string::npos) {
+        forced_fmt = av_find_input_format("mjpeg");
+    }
+
     int ret;
-    ret = avformat_open_input(&fmt_ctx_, "", nullptr, nullptr);
+    ret = avformat_open_input(&fmt_ctx_, "", forced_fmt, nullptr);
     if (ret < 0) {
         char errbuf[128];
         av_strerror(ret, errbuf, sizeof(errbuf));

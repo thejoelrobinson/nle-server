@@ -16,6 +16,19 @@
 
 import { WebCodecsDecoder } from './webcodecs_decoder.js';
 
+// FFmpeg AVCodecID constants (https://github.com/FFmpeg/FFmpeg/blob/master/libavcodec/codec_id.h)
+const CODEC_IDS = {
+  H264:        27,
+  HEVC:        173,
+  MPEG2VIDEO:  2,
+  MPEG4:       13,
+  MPEG1VIDEO:  1,
+  DNxHD:       144,
+  ProRes:      147,
+  VP9:         167,
+  AV1:         225,
+};
+
 // Emscripten artifacts are in build/wasm/, served by Vite's publicDir at /wasm/.
 // We load via fetch() + blob URL rather than dynamic import() to keep this file
 // out of Vite's module resolver path for that URL.
@@ -108,15 +121,36 @@ export class FrameServerBridge {
 
   /**
    * Open a video File object.
+   * Reads file in 1MB chunks with yields to prevent UI blocking.
    * @param {File} file
+   * @param {function} [progressCb] - Called with (bytesRead, totalBytes) for UI feedback
    */
-  async openFile(file) {
+  async openFile(file, progressCb = null) {
     await this.ready();
     if (this._server) { this._server.close(); this._server.delete(); this._server = null; }
 
-    // Read file into a Uint8Array and pass it directly to the C++ open() via
-    // Embind — no manual WASM heap management needed.
-    const bytes = new Uint8Array(await file.arrayBuffer());
+    // Read file in chunks (1MB at a time) to avoid blocking the main thread for large files
+    const chunkSize = 1024 * 1024; // 1MB
+    const bytes = new Uint8Array(file.size);
+    let offset = 0;
+
+    while (offset < file.size) {
+      const end = Math.min(offset + chunkSize, file.size);
+      const chunk = file.slice(offset, end);
+      const chunkBytes = new Uint8Array(await chunk.arrayBuffer());
+      bytes.set(chunkBytes, offset);
+      offset += chunkBytes.length;
+
+      if (progressCb) {
+        progressCb(Math.min(offset, file.size), file.size);
+      }
+
+      // Yield to event loop every chunk to keep UI responsive
+      await new Promise((r) => setTimeout(r, 0));
+    }
+
+    // Yield to event loop before synchronous WASM open() call
+    await new Promise((r) => setTimeout(r, 0));
 
     this._server = new this._mod.FrameServer();
     const ok = this._server.open(file.name, bytes);
@@ -196,10 +230,16 @@ export class FrameServerBridge {
     const pktData = this._server.get_encoded_packet_at(targetSecs);
     if (!pktData) return null;
 
+    // WebCodecs requires a keyframe after flush(). For delta frames, fall back
+    // to WASM software decode which handles GOP seeking internally.
+    if (!pktData.is_keyframe) {
+      return this._server.decode_frame_at(targetSecs) || null;
+    }
+
     const videoFrame = await this._webcodecs.decodeChunk({
       data:      pktData.data,
       timestamp: pktData.timestamp,
-      type:      pktData.is_keyframe ? 'key' : 'delta',
+      type:      'key',
     });
     if (!videoFrame) return null;
 
@@ -314,11 +354,27 @@ export class FrameServerPool {
 
   /**
    * Returns true if the codec produces long-GOP or intra-only video that
-   * benefits from a proxy.  Codec IDs are from the FFmpeg AVCodecID enum.
-   * H264=27, HEVC=173, MPEG2VIDEO=2, MPEG4=13, MPEG1VIDEO=1, DNxHD=144, ProRes=147
+   * benefits from a proxy.
    */
   static isLongGOP(codecId) {
-    return [27, 173, 2, 13, 1, 144, 147].includes(codecId);
+    return [
+      CODEC_IDS.H264,
+      CODEC_IDS.HEVC,
+      CODEC_IDS.MPEG2VIDEO,
+      CODEC_IDS.MPEG4,
+      CODEC_IDS.MPEG1VIDEO,
+      CODEC_IDS.DNxHD,
+      CODEC_IDS.ProRes,
+    ].includes(codecId);
+  }
+
+  /**
+   * Returns true if the codec has browser-native hardware decode via WebCodecs,
+   * meaning proxy generation can be skipped (WebCodecs handles seeking natively).
+   */
+  static hasWebCodecsDecode(codecId) {
+    return typeof VideoDecoder !== 'undefined'
+      && [CODEC_IDS.H264, CODEC_IDS.HEVC, CODEC_IDS.VP9, CODEC_IDS.AV1].includes(codecId);
   }
 
   // ── File hashing for proxy cache key ─────────────────────────────────────
@@ -372,21 +428,26 @@ export class FrameServerPool {
    * loads it immediately or queues background generation.
    * No-op if already loaded.
    * @param {File} file
+   * @param {function} [importProgressCb] - Called with (bytesRead, totalBytes) during file read
    */
-  async addFile(file) {
+  async addFile(file, importProgressCb = null) {
     if (this._pool.has(file.name)) return;
 
     const bridge = new FrameServerBridge();
     await bridge.ready();
-    await bridge.openFile(file);
+    await bridge.openFile(file, importProgressCb);
 
     const info = bridge.getStreamInfo();
     const entry = { bridge, proxyBridge: null, file, info, proxyHash: null };
     this._pool.set(file.name, entry);
 
-    // MXF always gets a proxy regardless of codec (MPEG-2, DNxHD, ProRes all need it).
+    // Skip proxy when WebCodecs hardware decode is available (H.264, HEVC, VP9, AV1).
+    // WebCodecs handles seeking natively — proxy only needed for codecs without it.
     const isMxf = file.name.toLowerCase().endsWith('.mxf');
-    if (info && (FrameServerPool.isLongGOP(info.codec_id) || isMxf)) {
+    const needsProxy = info
+      && (FrameServerPool.isLongGOP(info.codec_id) || isMxf)
+      && !FrameServerPool.hasWebCodecsDecode(info.codec_id);
+    if (needsProxy) {
       const hash = await FrameServerPool.hashFile(file);
       entry.proxyHash = hash;
 
@@ -428,6 +489,10 @@ export class FrameServerPool {
    * @param {string} path  key in this._pool
    */
   async _generateProxyBackground(path) {
+    // Yield so addFile() can return and the clip appears in the media bin
+    // before proxy generation blocks the main thread.
+    await new Promise((r) => setTimeout(r, 0));
+
     const entry = this._pool.get(path);
     if (!entry) return;
 
