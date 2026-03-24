@@ -396,6 +396,7 @@ function _buildJsMirrorEngine() {
     constructor() {
       this._sequences = new Map();
       this._clipIndex = new Map();
+      this._editGen = new Map();  // seq_id → edit generation counter
       this._nextId = 1;
     }
     _makeId(prefix) { return prefix + '_' + (this._nextId++); }
@@ -407,6 +408,14 @@ function _buildJsMirrorEngine() {
         video_tracks: [], audio_tracks: [],
       });
       return id;
+    }
+
+    _bumpGen(seqId) {
+      this._editGen.set(seqId, (this._editGen.get(seqId) ?? 0) + 1);
+    }
+
+    get_edit_generation(seqId) {
+      return this._editGen.get(seqId) ?? 0;
     }
 
     _getTrack(seqId, idx, isVideo) {
@@ -456,6 +465,7 @@ function _buildJsMirrorEngine() {
       const arr = seq.video_tracks;
       const tidx = arr.indexOf(track);
       this._clipIndex.set(id, { seqId, isVideo: true, trackIdx: tidx });
+      this._bumpGen(seqId);
       return id;
     }
 
@@ -483,12 +493,13 @@ function _buildJsMirrorEngine() {
         clip.track_index      = newTrackIdx;
         track.clips.sort((a, b) => a.timeline_in_pts - b.timeline_in_pts);
       }
+      this._bumpGen(loc.seqId);
       return true;
     }
 
     trim_clip(clipId, newSrcIn, newSrcOut) {
       if (newSrcOut <= newSrcIn) return false;
-      const { clip, track } = this._findClip(clipId);
+      const { clip, track, loc } = this._findClip(clipId);
       if (!clip) return false;
       const newDur = newSrcOut - newSrcIn;
       const newOut = clip.timeline_in_pts + newDur;
@@ -496,6 +507,7 @@ function _buildJsMirrorEngine() {
       clip.source_in_pts    = newSrcIn;
       clip.source_out_pts   = newSrcOut;
       clip.timeline_out_pts = newOut;
+      this._bumpGen(loc.seqId);
       return true;
     }
 
@@ -515,14 +527,16 @@ function _buildJsMirrorEngine() {
       track.clips.push(second);
       track.clips.sort((a, b) => a.timeline_in_pts - b.timeline_in_pts);
       this._clipIndex.set(secondId, { ...loc });
+      this._bumpGen(loc.seqId);
       return true;
     }
 
     remove_clip(clipId) {
-      const { clip, track } = this._findClip(clipId);
+      const { clip, track, loc } = this._findClip(clipId);
       if (!clip) return false;
       track.clips = track.clips.filter((c) => c.clip_id !== clipId);
       this._clipIndex.delete(clipId);
+      this._bumpGen(loc.seqId);
       return true;
     }
 
@@ -627,63 +641,69 @@ function _buildJsMirrorEngine() {
 
     set_track_muted(seqId, trackIdx, v) {
       const t = this._getTrack(seqId, trackIdx, true);
-      if (!t) return false; t.muted = v; return true;
+      if (!t) return false; t.muted = v; this._bumpGen(seqId); return true;
     }
     set_track_visible(seqId, trackIdx, v) {
       const t = this._getTrack(seqId, trackIdx, true);
-      if (!t) return false; t.visible = v; return true;
+      if (!t) return false; t.visible = v; this._bumpGen(seqId); return true;
     }
     set_track_locked(seqId, trackIdx, v) {
       const t = this._getTrack(seqId, trackIdx, true);
-      if (!t) return false; t.locked = v; return true;
+      if (!t) return false; t.locked = v; this._bumpGen(seqId); return true;
     }
 
     set_track_opacity(seqId, trackIdx, opacity) {
       const t = this._getTrack(seqId, trackIdx, true);
       if (!t) return false;
       t.opacity = Math.max(0, Math.min(1, opacity));
+      this._bumpGen(seqId);
       return true;
     }
 
     set_track_solo(seqId, trackIdx, v) {
       const t = this._getTrack(seqId, trackIdx, true);
-      if (!t) return false; t.solo = v; return true;
+      if (!t) return false; t.solo = v; this._bumpGen(seqId); return true;
     }
 
     set_clip_opacity(clipId, opacity) {
-      const { clip } = this._findClip(clipId);
+      const { clip, loc } = this._findClip(clipId);
       if (!clip) return false;
       clip.opacity = Math.max(0, Math.min(1, opacity));
+      this._bumpGen(loc.seqId);
       return true;
     }
 
     set_clip_position(clipId, posX, posY) {
-      const { clip } = this._findClip(clipId);
+      const { clip, loc } = this._findClip(clipId);
       if (!clip) return false;
       clip.posX = posX;
       clip.posY = posY;
+      this._bumpGen(loc.seqId);
       return true;
     }
 
     set_clip_scale(clipId, userScale) {
-      const { clip } = this._findClip(clipId);
+      const { clip, loc } = this._findClip(clipId);
       if (!clip) return false;
       clip.userScale = Math.max(0.1, userScale);
+      this._bumpGen(loc.seqId);
       return true;
     }
 
     set_clip_anchor(clipId, anchorX, anchorY) {
-      const { clip } = this._findClip(clipId);
+      const { clip, loc } = this._findClip(clipId);
       if (!clip) return false;
       clip.anchorX = Math.max(0, Math.min(1, anchorX));
       clip.anchorY = Math.max(0, Math.min(1, anchorY));
+      this._bumpGen(loc.seqId);
       return true;
     }
 
     set_clip_blend_mode(clipId, blendMode) {
-      const { clip } = this._findClip(clipId);
+      const { clip, loc } = this._findClip(clipId);
       if (!clip) return false;
       clip.blendMode = Math.max(0, Math.min(4, blendMode));
+      this._bumpGen(loc.seqId);
       return true;
     }
   }

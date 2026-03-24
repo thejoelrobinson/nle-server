@@ -143,12 +143,22 @@ public:
     int64_t pts_from_frame(int frame_number, int fps_num, int fps_den);
     int     frame_from_pts(int64_t pts, int fps_num, int fps_den);
 
+    // ── Edit Generation (for cache invalidation) ──────────────────────────
+    /// Get the current edit generation number for a sequence.
+    /// Increments whenever clips or tracks are modified.
+    int get_edit_generation(const std::string& seq_id) const;
+
 private:
     std::map<std::string, Sequence> sequences_;
 
     // clip_id → (seq_id, is_video_track, track_vector_index)
     struct ClipLocation { std::string seq_id; bool is_video; size_t track_idx; };
     std::map<std::string, ClipLocation> clip_index_;
+
+    // seq_id → edit generation counter (increments on any mutation)
+    std::map<std::string, int> edit_generation_;
+
+    void _bump_gen(const std::string& seq_id);
 
     int next_id_ = 1;
     std::string make_id(const std::string& prefix);

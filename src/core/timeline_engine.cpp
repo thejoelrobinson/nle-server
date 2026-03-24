@@ -160,6 +160,7 @@ std::string TimelineEngine::add_clip(const std::string& seq_id,
     sort_track(*track);
 
     clip_index_[id] = { seq_id, is_video, tidx };
+    _bump_gen(seq_id);
     return id;
 }
 
@@ -214,6 +215,7 @@ bool TimelineEngine::move_clip(const std::string& clip_id,
         sort_track(*old_track);
     }
 
+    _bump_gen(loc.seq_id);
     return true;
 }
 
@@ -238,6 +240,9 @@ bool TimelineEngine::trim_clip(const std::string& clip_id,
     clip->source_in_pts    = new_source_in_pts;
     clip->source_out_pts   = new_source_out_pts;
     clip->timeline_out_pts = new_out;
+
+    auto& loc = clip_index_[clip_id];
+    _bump_gen(loc.seq_id);
     return true;
 }
 
@@ -278,6 +283,7 @@ bool TimelineEngine::split_clip(const std::string& clip_id,
     sort_track(*track);
 
     clip_index_[second_id] = loc;
+    _bump_gen(loc.seq_id);
     return true;
 }
 
@@ -286,11 +292,15 @@ bool TimelineEngine::remove_clip(const std::string& clip_id) {
     ClipRef* clip  = find_clip_ref(clip_id, &track);
     if (!clip || !track) return false;
 
+    auto& loc = clip_index_[clip_id];
+    std::string seq_id = loc.seq_id;
+
     track->clips.erase(
         std::remove_if(track->clips.begin(), track->clips.end(),
                        [&](const ClipRef& c){ return c.clip_id == clip_id; }),
         track->clips.end());
     clip_index_.erase(clip_id);
+    _bump_gen(seq_id);
     return true;
 }
 
@@ -302,6 +312,7 @@ bool TimelineEngine::set_clip_opacity(const std::string& clip_id, float opacity)
     ClipRef* clip = find_clip_ref(clip_id);
     if (!clip) return false;
     clip->opacity = std::max(0.0f, std::min(1.0f, opacity));
+    _bump_gen(clip_index_[clip_id].seq_id);
     return true;
 }
 
@@ -310,6 +321,7 @@ bool TimelineEngine::set_clip_position(const std::string& clip_id, float posX, f
     if (!clip) return false;
     clip->posX = posX;
     clip->posY = posY;
+    _bump_gen(clip_index_[clip_id].seq_id);
     return true;
 }
 
@@ -317,6 +329,7 @@ bool TimelineEngine::set_clip_scale(const std::string& clip_id, float userScale)
     ClipRef* clip = find_clip_ref(clip_id);
     if (!clip) return false;
     clip->userScale = std::max(0.1f, userScale);  // Prevent zero/negative scale
+    _bump_gen(clip_index_[clip_id].seq_id);
     return true;
 }
 
@@ -325,6 +338,7 @@ bool TimelineEngine::set_clip_anchor(const std::string& clip_id, float anchorX, 
     if (!clip) return false;
     clip->anchorX = std::max(0.0f, std::min(1.0f, anchorX));
     clip->anchorY = std::max(0.0f, std::min(1.0f, anchorY));
+    _bump_gen(clip_index_[clip_id].seq_id);
     return true;
 }
 
@@ -332,6 +346,7 @@ bool TimelineEngine::set_clip_blend_mode(const std::string& clip_id, int blendMo
     ClipRef* clip = find_clip_ref(clip_id);
     if (!clip) return false;
     clip->blendMode = std::max(0, std::min(4, blendMode));  // Clamp to valid range
+    _bump_gen(clip_index_[clip_id].seq_id);
     return true;
 }
 
@@ -344,6 +359,7 @@ bool TimelineEngine::set_track_muted(const std::string& seq_id,
     Track* t = find_track(seq_id, track_index, TrackType::VIDEO);
     if (!t) return false;
     t->muted = v;
+    _bump_gen(seq_id);
     return true;
 }
 
@@ -352,6 +368,7 @@ bool TimelineEngine::set_track_visible(const std::string& seq_id,
     Track* t = find_track(seq_id, track_index, TrackType::VIDEO);
     if (!t) return false;
     t->visible = v;
+    _bump_gen(seq_id);
     return true;
 }
 
@@ -360,6 +377,7 @@ bool TimelineEngine::set_track_locked(const std::string& seq_id,
     Track* t = find_track(seq_id, track_index, TrackType::VIDEO);
     if (!t) return false;
     t->locked = v;
+    _bump_gen(seq_id);
     return true;
 }
 
@@ -368,6 +386,7 @@ bool TimelineEngine::set_track_opacity(const std::string& seq_id,
     Track* t = find_track(seq_id, track_index, TrackType::VIDEO);
     if (!t) return false;
     t->opacity = std::max(0.0f, std::min(1.0f, opacity));
+    _bump_gen(seq_id);
     return true;
 }
 
@@ -376,6 +395,7 @@ bool TimelineEngine::set_track_solo(const std::string& seq_id,
     Track* t = find_track(seq_id, track_index, TrackType::VIDEO);
     if (!t) return false;
     t->solo = v;
+    _bump_gen(seq_id);
     return true;
 }
 
@@ -655,4 +675,17 @@ int TimelineEngine::frame_from_pts(int64_t pts, int fps_num, int fps_den) {
     // Add half a frame period to compensate for µs rounding in pts_from_frame.
     const int64_t half = (static_cast<int64_t>(NLE_TIME_BASE) * fps_den) / 2;
     return static_cast<int>((pts * fps_num + half) / (NLE_TIME_BASE * fps_den));
+}
+
+// ---------------------------------------------------------------------------
+// Edit Generation (for cache invalidation)
+// ---------------------------------------------------------------------------
+
+void TimelineEngine::_bump_gen(const std::string& seq_id) {
+    edit_generation_[seq_id]++;
+}
+
+int TimelineEngine::get_edit_generation(const std::string& seq_id) const {
+    auto it = edit_generation_.find(seq_id);
+    return (it != edit_generation_.end()) ? it->second : 0;
 }

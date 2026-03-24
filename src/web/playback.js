@@ -1,4 +1,6 @@
 import { FrameCache } from './frame_cache.js';
+import { CompositionCache } from './composition_cache.js';
+import { DiskFrameCache } from './disk_cache.js';
 import { frameDurationUs, usToSecs } from './timecode.js';
 
 /**
@@ -100,6 +102,9 @@ export class Playback {
     this._seqH        = height;
 
     this._cache = new FrameCache(computeCacheSize(width, height));
+    this._compositionCache = new CompositionCache(5);
+    this._diskCache = new DiskFrameCache();
+    this._diskCache._openDB().catch(() => {}); // warm up IDB connection on startup
 
     this._isPlaying   = false;
     this._rafId       = null;
@@ -168,7 +173,6 @@ export class Playback {
     if (!this._isPlaying) return;
     this._isPlaying   = false;   // also stops _decodeLoop
     this._lastFrameMs = null;
-    this._cache.clear();
     if (this._rafId !== null) { cancelAnimationFrame(this._rafId); this._rafId = null; }
     this._audio.stop();
     this._onStateChange?.(false);
@@ -200,7 +204,6 @@ export class Playback {
    */
   syncPlayheadPts(pts) {
     this._playheadPts            = pts;
-    this._cache.clear();
     this._lastResolvedSourcePath = null;  // invalidate colorspace cache on seek
     this._updateTimelineDisplay(pts);
     this._onTimecode?.(pts);
@@ -262,6 +265,37 @@ export class Playback {
       ? this._engine.resolve_all_frames(this._seqId, this._playheadPts)
       : [];
 
+    // ── L1 Composition Cache check ────────────────────────────────────────
+    if (this._engine && this._seqId && this._player) {
+      const editGen = this._engine.get_edit_generation?.(this._seqId) ?? 0;
+      const frameDuration = frameDurationUs(this._fps);
+      const frameIndex = Math.round(this._playheadPts / frameDuration);
+      const l1Hit = this._compositionCache.get(this._seqId, editGen, frameIndex);
+      if (l1Hit) {
+        this._player.drawFrameFull(l1Hit);
+        this._onFrameState?.(true);
+        this._onTimecode?.(this._playheadPts);
+        // Still update timeline and audio on L1 hit
+        this._tickCount++;
+        if (this._tickCount % 2 === 0) {
+          this._updateTimelineDisplay(this._playheadPts);
+        } else {
+          if (this._timeline) this._timeline._playhead = this._playheadPts;
+        }
+        const topClip = this._engine.resolve_frame(this._seqId, this._playheadPts);
+        setTimeout(() => this._decodeAndPushAudio(this._playheadPts, topClip), 0);
+        if (this._duration > 0 && this._playheadPts >= this._duration) {
+          this._isPlaying   = false;
+          this._rafId       = null;
+          this._lastFrameMs = null;
+          this._onStateChange?.(false);
+          return;
+        }
+        this._rafId = requestAnimationFrame((now2) => this._tick(now2));
+        return; // Skip L2 cache path
+      }
+    }
+
     // ── Draw (cache-first; trigger async decode on miss) ──────────────────
     if (allResolved.length === 0) {
       // No clips under playhead — clear canvas to black
@@ -286,6 +320,17 @@ export class Playback {
           }
         });
         this._onFrameState?.(true);
+
+        // ── Capture composited canvas for L1 cache (async, non-blocking) ────
+        if (this._engine && this._seqId) {
+          const editGen = this._engine.get_edit_generation?.(this._seqId) ?? 0;
+          const frameDuration = frameDurationUs(this._fps);
+          const frameIndex = Math.round(this._playheadPts / frameDuration);
+          const w = this._seqW, h = this._seqH;
+          createImageBitmap(this._player.canvas).then((bm) => {
+            this._compositionCache.set(this._seqId, editGen, frameIndex, { bitmap: bm, width: w, height: h });
+          }).catch(() => {}); // Non-fatal if capture fails
+        }
       } else {
         // Cache miss — fire async decode
         this._decodeAndDisplay(this._playheadPts, allResolved);
@@ -355,6 +400,13 @@ export class Playback {
           const sourcePts = Math.round(resolved.source_pts);
           if (this._cache.has(resolved.source_path, sourcePts)) continue;
 
+          // ── L3 check on L2 miss ────────────────────────────────────────────
+          let cached = await this._diskCache.lookup(resolved.source_path, sourcePts);
+          if (cached) {
+            this._cache.set(resolved.source_path, sourcePts, cached);
+            continue; // L3 hit — skip WASM decode
+          }
+
           // decodeFrameAt is async on both the WebCodecs and WASM paths.
           // Wrap in try/catch: any decode error must NOT kill the loop — a
           // single bad frame should be skipped, not crash the entire prefetch.
@@ -370,14 +422,20 @@ export class Playback {
           }
           if (!frameData) continue;
 
-          let cached;
           try {
             cached = await _toImageBitmapIfNeeded(frameData);
           } catch (e) {
             console.warn('[Playback] _decodeLoop bitmap conversion error (skipping frame):', e); // eslint-disable-line no-console
             continue;
           }
-          if (cached) this._cache.set(resolved.source_path, sourcePts, cached);
+          if (cached) {
+            this._cache.set(resolved.source_path, sourcePts, cached);
+            // Store in L3 async (fire-and-forget, only for bitmap frames)
+            if (cached.bitmap) {
+              this._diskCache.store(resolved.source_path, sourcePts, cached.bitmap, cached.width, cached.height)
+                .catch(() => {}); // non-fatal
+            }
+          }
         }
       }
 
@@ -421,6 +479,19 @@ export class Playback {
         return;
       }
 
+      // ── L1 Composition Cache check before decode ──────────────────────────
+      if (this._engine && this._seqId && this._player) {
+        const editGen = this._engine.get_edit_generation?.(this._seqId) ?? 0;
+        const frameDuration = frameDurationUs(this._fps);
+        const frameIndex = Math.round(pts / frameDuration);
+        const l1Hit = this._compositionCache.get(this._seqId, editGen, frameIndex);
+        if (l1Hit) {
+          this._player.drawFrameFull(l1Hit);
+          this._onFrameState?.(true);
+          return; // Skip decode and composite
+        }
+      }
+
       // Decode and composite all clips
       if (this._player) this._player.clear();
 
@@ -428,12 +499,26 @@ export class Playback {
         const sourcePts = Math.round(resolved.source_pts);
         let frame = this._cache.get(resolved.source_path, sourcePts);
         if (!frame) {
-          const frameData = await this._pool.decodeFrameAt(
-            resolved.source_path,
-            usToSecs(resolved.source_pts)
-          );
-          frame = await _toImageBitmapIfNeeded(frameData);
-          if (frame) this._cache.set(resolved.source_path, sourcePts, frame);
+          // ── L3 check on L2 miss ────────────────────────────────────────────
+          frame = await this._diskCache.lookup(resolved.source_path, sourcePts);
+          if (frame) {
+            this._cache.set(resolved.source_path, sourcePts, frame);
+          } else {
+            // L2 + L3 miss → WASM decode
+            const frameData = await this._pool.decodeFrameAt(
+              resolved.source_path,
+              usToSecs(resolved.source_pts)
+            );
+            frame = await _toImageBitmapIfNeeded(frameData);
+            if (frame) {
+              this._cache.set(resolved.source_path, sourcePts, frame);
+              // Store in L3 async (fire-and-forget, only for bitmap frames)
+              if (frame.bitmap) {
+                this._diskCache.store(resolved.source_path, sourcePts, frame.bitmap, frame.width, frame.height)
+                  .catch(() => {}); // non-fatal
+              }
+            }
+          }
         }
 
         if (frame && this._player) {
@@ -442,6 +527,17 @@ export class Playback {
           const transform = this._computeTransform(resolved.source_path, resolved);
           this._player.drawFrameAt({ ...frame, colorspace }, { ...transform, opacity: resolved.opacity ?? 1.0 });
         }
+      }
+
+      // ── Capture composited canvas for L1 cache (async, non-blocking) ────
+      if (this._engine && this._seqId && this._player) {
+        const editGen = this._engine.get_edit_generation?.(this._seqId) ?? 0;
+        const frameDuration = frameDurationUs(this._fps);
+        const frameIndex = Math.round(pts / frameDuration);
+        const w = this._seqW, h = this._seqH;
+        createImageBitmap(this._player.canvas).then((bm) => {
+          this._compositionCache.set(this._seqId, editGen, frameIndex, { bitmap: bm, width: w, height: h });
+        }).catch(() => {}); // Non-fatal if capture fails
       }
 
       this._onFrameState?.(true);

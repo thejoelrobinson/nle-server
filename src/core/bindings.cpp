@@ -60,8 +60,9 @@ EMSCRIPTEN_BINDINGS(nle_timeline_engine) {
         .function("get_sequence_duration",&TimelineEngine::get_sequence_duration)
         .function("get_sequence_json",    &TimelineEngine::get_sequence_json)
         .function("load_sequence_json",   &TimelineEngine::load_sequence_json)
-        .function("pts_from_frame",       &TimelineEngine::pts_from_frame)
-        .function("frame_from_pts",       &TimelineEngine::frame_from_pts)
+        .function("pts_from_frame",         &TimelineEngine::pts_from_frame)
+        .function("frame_from_pts",         &TimelineEngine::frame_from_pts)
+        .function("get_edit_generation",    &TimelineEngine::get_edit_generation)
         ;
 
     // Module-level singleton getter
