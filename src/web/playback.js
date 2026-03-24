@@ -274,7 +274,7 @@ export class Playback {
     this._onTimecode?.(this._playheadPts);
 
     // ── Audio (throttled inside _decodeAndPushAudio) ──────────────────────
-    setTimeout(() => this._decodeAndPushAudio(this._playheadPts, resolved).catch(() => {}), 0);
+    setTimeout(() => this._decodeAndPushAudio(this._playheadPts, resolved), 0);
 
     // Stop at end of sequence
     if (this._duration > 0 && this._playheadPts >= this._duration) {
