@@ -236,21 +236,13 @@ export class Playback {
       ? this._engine.resolve_frame(this._seqId, this._playheadPts)
       : null;
 
-    // ── Draw from cache — zero WASM calls ─────────────────────────────────
-    // Compute roundedPts and frame outside the player guard so the diagnostic
-    // log fires every tick regardless of whether _player is set yet.
-    const roundedPts = resolved?.source_pts != null ? Math.round(resolved.source_pts) : null;
-    const frame = (resolved?.source_path && roundedPts != null)
-      ? this._cache.get(resolved.source_path, roundedPts)
-      : null;
-
-    if (this._tickCount % 60 === 0) {
-      console.log(`[_tick#${this._tickCount}] pts=${Math.round(this._playheadPts)} seqId=${this._seqId} resolved=${!!resolved} hit=${!!frame} player=${!!this._player}`); // eslint-disable-line no-console
-    }
-
+    // ── Draw (cache-first; trigger async decode on miss) ──────────────────
     if (resolved?.source_path && this._player) {
+      const sourcePts = Math.round(resolved.source_pts);
+      const frame = this._cache.get(resolved.source_path, sourcePts);
+
       if (frame) {
-        // Colorspace: only look up when source file changes
+        // Cache hit — colorspace: only look up when source file changes
         if (resolved.source_path !== this._lastResolvedSourcePath) {
           this._lastResolvedSourcePath = resolved.source_path;
           const info = this._pool.getInfo(resolved.source_path);
@@ -258,9 +250,11 @@ export class Playback {
         }
         this._player.drawFrame({ ...frame, colorspace: this._lastColorspace });
         this._onFrameState?.(true);
+      } else {
+        // Cache miss — fire async decode; on the WASM path this resolves as a
+        // microtask (before the next rAF tick), so the frame draws immediately.
+        this._decodeAndDisplay(this._playheadPts, resolved);
       }
-    } else if (resolved?.source_path && !this._player) {
-      console.warn('[_tick] _player is null — call setProgramPlayer() before play()'); // eslint-disable-line no-console
     }
 
     // ── Timeline: repaint every other tick (~30 fps) ──────────────────────
@@ -330,7 +324,6 @@ export class Playback {
             resolved.source_path,
             usToSecs(resolved.source_pts)
           );
-          console.log('[_decodeLoop] resolve_frame →', resolved, '| frameData:', frameData ? 'ok' : 'null'); // eslint-disable-line no-console
         } catch (e) {
           console.warn('[Playback] _decodeLoop decode error (skipping frame):', e); // eslint-disable-line no-console
           continue;
