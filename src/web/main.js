@@ -342,6 +342,7 @@ requestAnimationFrame(() => {
   initProject();
   initSequenceCreator();
   initSequenceSettings();
+  _initInspectorUI();
 });
 
 // Save / Load project buttons
@@ -448,7 +449,8 @@ function _buildJsMirrorEngine() {
       if (this._hasOverlap(track.clips, timeline_in_pts, tlOut)) return '';
       const id = this._makeId('c');
       track.clips.push({ clip_id: id, source_path, source_in_pts, source_out_pts,
-                         timeline_in_pts, timeline_out_pts: tlOut, track_index });
+                         timeline_in_pts, timeline_out_pts: tlOut, track_index,
+                         opacity: 1.0, posX: 0, posY: 0, anchorX: 0.5, anchorY: 0.5, userScale: 1.0, blendMode: 0 });
       track.clips.sort((a, b) => a.timeline_in_pts - b.timeline_in_pts);
       const seq = this._sequences.get(seqId);
       const arr = seq.video_tracks;
@@ -555,11 +557,14 @@ function _buildJsMirrorEngine() {
               source_path: c.source_path,
               source_pts: c.source_in_pts + (pts - c.timeline_in_pts),
               colorspace: c.colorspace ?? 5,
+              opacity: c.opacity ?? 1.0,
               posX: c.posX ?? 0,
               posY: c.posY ?? 0,
               anchorX: c.anchorX ?? 0.5,
               anchorY: c.anchorY ?? 0.5,
               userScale: c.userScale ?? 1.0,
+              blendMode: c.blendMode ?? 0,
+              clip_id: c.clip_id,
             });
             break; // Only one clip per track at a given time
           }
@@ -632,7 +637,223 @@ function _buildJsMirrorEngine() {
       const t = this._getTrack(seqId, trackIdx, true);
       if (!t) return false; t.locked = v; return true;
     }
+
+    set_track_opacity(seqId, trackIdx, opacity) {
+      const t = this._getTrack(seqId, trackIdx, true);
+      if (!t) return false;
+      t.opacity = Math.max(0, Math.min(1, opacity));
+      return true;
+    }
+
+    set_track_solo(seqId, trackIdx, v) {
+      const t = this._getTrack(seqId, trackIdx, true);
+      if (!t) return false; t.solo = v; return true;
+    }
+
+    set_clip_opacity(clipId, opacity) {
+      const { clip } = this._findClip(clipId);
+      if (!clip) return false;
+      clip.opacity = Math.max(0, Math.min(1, opacity));
+      return true;
+    }
+
+    set_clip_position(clipId, posX, posY) {
+      const { clip } = this._findClip(clipId);
+      if (!clip) return false;
+      clip.posX = posX;
+      clip.posY = posY;
+      return true;
+    }
+
+    set_clip_scale(clipId, userScale) {
+      const { clip } = this._findClip(clipId);
+      if (!clip) return false;
+      clip.userScale = Math.max(0.1, userScale);
+      return true;
+    }
+
+    set_clip_anchor(clipId, anchorX, anchorY) {
+      const { clip } = this._findClip(clipId);
+      if (!clip) return false;
+      clip.anchorX = Math.max(0, Math.min(1, anchorX));
+      clip.anchorY = Math.max(0, Math.min(1, anchorY));
+      return true;
+    }
+
+    set_clip_blend_mode(clipId, blendMode) {
+      const { clip } = this._findClip(clipId);
+      if (!clip) return false;
+      clip.blendMode = Math.max(0, Math.min(4, blendMode));
+      return true;
+    }
   }
 
   return new Engine();
+}
+
+// ── Inspector panel setup ──────────────────────────────────────────────────
+
+let _selectedClipId = null;
+let _blendModeSelect = null;  // Declare here so it's accessible in both functions
+
+function _updateInspectorPanel() {
+  const inspectorPanel = document.getElementById('inspector-panel');
+  const inspectorContent = document.getElementById('inspector-content');
+  const inspectorEmpty = document.getElementById('inspector-empty');
+  const dividerCol3 = document.getElementById('divider-col-3');
+
+  if (!_selectedClipId) {
+    // No selection — hide inspector
+    if (inspectorPanel) inspectorPanel.style.display = 'none';
+    if (dividerCol3) dividerCol3.style.display = 'none';
+    return;
+  }
+
+  // Show inspector and update values
+  if (inspectorPanel) inspectorPanel.style.display = 'flex';
+  if (dividerCol3) dividerCol3.style.display = 'block';
+
+  // Find the selected clip
+  const { clip } = _engine._findClip(_selectedClipId);
+  if (!clip) {
+    if (inspectorEmpty) inspectorEmpty.style.display = 'block';
+    if (inspectorContent) inspectorContent.style.display = 'none';
+    return;
+  }
+
+  if (inspectorEmpty) inspectorEmpty.style.display = 'none';
+  if (inspectorContent) inspectorContent.style.display = 'flex';
+
+  // Update input values
+  const opacitySlider = document.getElementById('inspector-opacity');
+  const opacityValue = document.getElementById('inspector-opacity-value');
+  const posXInput = document.getElementById('inspector-pos-x');
+  const posYInput = document.getElementById('inspector-pos-y');
+  const scaleSlider = document.getElementById('inspector-scale');
+  const scaleValue = document.getElementById('inspector-scale-value');
+  const anchorXInput = document.getElementById('inspector-anchor-x');
+  const anchorYInput = document.getElementById('inspector-anchor-y');
+
+  if (opacitySlider && opacityValue) {
+    const opacityPercent = Math.round(clip.opacity * 100);
+    opacitySlider.value = opacityPercent;
+    opacityValue.textContent = opacityPercent + '%';
+  }
+  if (posXInput) posXInput.value = clip.posX ?? 0;
+  if (posYInput) posYInput.value = clip.posY ?? 0;
+  if (scaleSlider && scaleValue) {
+    const scalePercent = Math.round((clip.userScale ?? 1.0) * 100);
+    scaleSlider.value = scalePercent;
+    scaleValue.textContent = scalePercent + '%';
+  }
+  if (anchorXInput) anchorXInput.value = clip.anchorX ?? 0.5;
+  if (anchorYInput) anchorYInput.value = clip.anchorY ?? 0.5;
+  if (_blendModeSelect) _blendModeSelect.value = clip.blendMode ?? 0;
+}
+
+function _initInspectorHandlers() {
+  const opacitySlider = document.getElementById('inspector-opacity');
+  const opacityValue = document.getElementById('inspector-opacity-value');
+  const posXInput = document.getElementById('inspector-pos-x');
+  const posYInput = document.getElementById('inspector-pos-y');
+  const scaleSlider = document.getElementById('inspector-scale');
+  const scaleValue = document.getElementById('inspector-scale-value');
+  const anchorXInput = document.getElementById('inspector-anchor-x');
+  const anchorYInput = document.getElementById('inspector-anchor-y');
+  _blendModeSelect = document.getElementById('inspector-blend-mode');
+
+  if (opacitySlider) {
+    opacitySlider.addEventListener('input', (e) => {
+      const value = parseInt(e.target.value) / 100;
+      if (_selectedClipId && _engine) {
+        _engine.set_clip_opacity(_selectedClipId, value);
+      }
+      if (opacityValue) opacityValue.textContent = e.target.value + '%';
+    });
+  }
+
+  if (posXInput) {
+    posXInput.addEventListener('input', (e) => {
+      if (_selectedClipId && _engine) {
+        const posY = parseFloat(document.getElementById('inspector-pos-y')?.value ?? 0);
+        _engine.set_clip_position(_selectedClipId, parseFloat(e.target.value), posY);
+      }
+    });
+  }
+
+  if (posYInput) {
+    posYInput.addEventListener('input', (e) => {
+      if (_selectedClipId && _engine) {
+        const posX = parseFloat(document.getElementById('inspector-pos-x')?.value ?? 0);
+        _engine.set_clip_position(_selectedClipId, posX, parseFloat(e.target.value));
+      }
+    });
+  }
+
+  if (scaleSlider) {
+    scaleSlider.addEventListener('input', (e) => {
+      const value = parseInt(e.target.value) / 100;
+      if (_selectedClipId && _engine) {
+        _engine.set_clip_scale(_selectedClipId, value);
+      }
+      if (scaleValue) scaleValue.textContent = e.target.value + '%';
+    });
+  }
+
+  if (anchorXInput) {
+    anchorXInput.addEventListener('input', (e) => {
+      if (_selectedClipId && _engine) {
+        const anchorY = parseFloat(document.getElementById('inspector-anchor-y')?.value ?? 0.5);
+        _engine.set_clip_anchor(_selectedClipId, parseFloat(e.target.value), anchorY);
+      }
+    });
+  }
+
+  if (anchorYInput) {
+    anchorYInput.addEventListener('input', (e) => {
+      if (_selectedClipId && _engine) {
+        const anchorX = parseFloat(document.getElementById('inspector-anchor-x')?.value ?? 0.5);
+        _engine.set_clip_anchor(_selectedClipId, anchorX, parseFloat(e.target.value));
+      }
+    });
+  }
+
+  if (_blendModeSelect) {
+    _blendModeSelect.addEventListener('change', (e) => {
+      if (_selectedClipId && _engine) {
+        _engine.set_clip_blend_mode(_selectedClipId, parseInt(e.target.value));
+      }
+    });
+  }
+}
+
+// Initialize inspector panel after engine is ready
+function _initInspectorUI() {
+  _initInspectorHandlers();
+  _updateInspectorPanel();
+
+  // Listen for timeline clip selection events
+  const timelineCanvas = document.getElementById('timeline-canvas');
+  if (timelineCanvas) {
+    timelineCanvas.addEventListener('clip-selected', (e) => {
+      _selectedClipId = e.detail?.clipId ?? null;
+      _updateInspectorPanel();
+    });
+
+    timelineCanvas.addEventListener('clip-deselected', (e) => {
+      _selectedClipId = null;
+      _updateInspectorPanel();
+    });
+  }
+
+  // Fallback: hook into window functions for manual selection
+  window._onClipSelected = function(clipId) {
+    _selectedClipId = clipId;
+    _updateInspectorPanel();
+  };
+
+  window._onClipDeselected = function() {
+    _selectedClipId = null;
+    _updateInspectorPanel();
+  };
 }

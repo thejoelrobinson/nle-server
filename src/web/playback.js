@@ -282,7 +282,7 @@ export class Playback {
           const frame = this._cache.get(resolved.source_path, sourcePts);
           if (frame) {
             const transform = this._computeTransform(resolved.source_path, resolved);
-            this._player.drawFrameAt({ ...frame, colorspace: mapFFmpegColorspace(this._pool.getInfo(resolved.source_path)?.colorspace ?? AVCOL_SPC_BT709) }, transform);
+            this._player.drawFrameAt({ ...frame, colorspace: mapFFmpegColorspace(this._pool.getInfo(resolved.source_path)?.colorspace ?? AVCOL_SPC_BT709) }, { ...transform, opacity: resolved.opacity ?? 1.0 });
           }
         });
         this._onFrameState?.(true);
@@ -440,7 +440,7 @@ export class Playback {
           const info = this._pool.getInfo(resolved.source_path);
           const colorspace = mapFFmpegColorspace(info?.colorspace ?? AVCOL_SPC_BT709);
           const transform = this._computeTransform(resolved.source_path, resolved);
-          this._player.drawFrameAt({ ...frame, colorspace }, transform);
+          this._player.drawFrameAt({ ...frame, colorspace }, { ...transform, opacity: resolved.opacity ?? 1.0 });
         }
       }
 

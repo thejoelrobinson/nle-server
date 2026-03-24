@@ -30,6 +30,15 @@ struct ClipRef {
     int color_primaries = 1;
     int color_trc      = 1;
     int colorspace     = 5;  // AVCOL_SPC_SMPTE170M (BT.601 default)
+
+    // Compositor fields (for GPU rendering with opacity, transform, etc.)
+    float opacity   = 1.0f;   // 0.0 = transparent, 1.0 = opaque
+    float posX      = 0.0f;   // pixels from sequence center (X)
+    float posY      = 0.0f;   // pixels from sequence center (Y)
+    float anchorX   = 0.5f;   // anchor point 0.0–1.0 (0.5 = center)
+    float anchorY   = 0.5f;
+    float userScale = 1.0f;   // uniform scale multiplier
+    int blendMode   = 0;      // 0=normal, 1=multiply, 2=screen, 3=overlay, 4=add, etc.
 };
 
 struct Track {
@@ -39,6 +48,8 @@ struct Track {
     bool                 muted   = false;
     bool                 locked  = false;
     bool                 visible = true;
+    bool                 solo    = false;   // Solo track (only this track plays)
+    float                opacity = 1.0f;    // Track-level opacity (0.0–1.0)
     std::vector<ClipRef> clips;  // always sorted by timeline_in_pts
 };
 
@@ -89,15 +100,37 @@ public:
 
     bool remove_clip(const std::string& clip_id);
 
+    // ── Clip properties ───────────────────────────────────────────────────
+    /// Set opacity on a clip (0.0 = transparent, 1.0 = opaque)
+    bool set_clip_opacity(const std::string& clip_id, float opacity);
+
+    /// Set clip position (pixels from sequence center)
+    bool set_clip_position(const std::string& clip_id, float posX, float posY);
+
+    /// Set clip scale (uniform multiplier)
+    bool set_clip_scale(const std::string& clip_id, float userScale);
+
+    /// Set clip anchor point (0.0–1.0)
+    bool set_clip_anchor(const std::string& clip_id, float anchorX, float anchorY);
+
+    /// Set clip blend mode (0=normal, 1=multiply, 2=screen, 3=overlay, 4=add)
+    bool set_clip_blend_mode(const std::string& clip_id, int blendMode);
+
     // ── Track management ──────────────────────────────────────────────────
     bool set_track_muted  (const std::string& seq_id, int track_index, bool v);
     bool set_track_visible(const std::string& seq_id, int track_index, bool v);
     bool set_track_locked (const std::string& seq_id, int track_index, bool v);
+    bool set_track_opacity(const std::string& seq_id, int track_index, float opacity);
+    bool set_track_solo   (const std::string& seq_id, int track_index, bool v);
 
     // ── Resolution ────────────────────────────────────────────────────────
     /// Returns { source_path, source_pts } or null if no clip covers timeline_pts.
     /// Picks the topmost (highest track_index) visible, unmuted video track.
     emscripten::val resolve_frame(const std::string& seq_id, int64_t timeline_pts);
+
+    /// Returns array of all visible clips at timeline_pts (bottom-to-top).
+    /// Each entry includes opacity, transform, and all clip properties.
+    emscripten::val resolve_all_frames(const std::string& seq_id, int64_t timeline_pts);
 
     // ── Duration ──────────────────────────────────────────────────────────
     int64_t get_sequence_duration(const std::string& seq_id);

@@ -24,9 +24,41 @@ void main() {
 const FRAG_SRC_RGBA = `
 precision mediump float;
 uniform sampler2D uTex;
+uniform float     uOpacity;
 varying   vec2 vTexCoord;
 void main() {
-  gl_FragColor = texture2D(uTex, vTexCoord);
+  vec4 c = texture2D(uTex, vTexCoord);
+  gl_FragColor = vec4(c.rgb, c.a * uOpacity);
+}
+`;
+
+// Blend mode compositor shader — applies blend mode between FBO and background
+const FRAG_SRC_BLEND = `
+precision mediump float;
+uniform sampler2D uFbo;        // Current layer FBO
+uniform sampler2D uBackground; // Accumulated background
+uniform int       uBlendMode;  // 0=normal, 1=multiply, 2=screen, 3=overlay, 4=add
+varying   vec2 vTexCoord;
+
+vec3 multiply(vec3 fg, vec3 bg) { return fg * bg; }
+vec3 screen(vec3 fg, vec3 bg) { return 1.0 - (1.0 - fg) * (1.0 - bg); }
+vec3 overlay(vec3 fg, vec3 bg) {
+  return mix(2.0 * fg * bg, 1.0 - 2.0 * (1.0 - fg) * (1.0 - bg), step(0.5, bg));
+}
+vec3 add(vec3 fg, vec3 bg) { return clamp(fg + bg, 0.0, 1.0); }
+
+void main() {
+  vec4 fgColor = texture2D(uFbo, vTexCoord);
+  vec4 bgColor = texture2D(uBackground, vTexCoord);
+
+  vec3 blended = bgColor.rgb;
+  if (uBlendMode == 1) blended = multiply(fgColor.rgb, bgColor.rgb);
+  else if (uBlendMode == 2) blended = screen(fgColor.rgb, bgColor.rgb);
+  else if (uBlendMode == 3) blended = overlay(fgColor.rgb, bgColor.rgb);
+  else if (uBlendMode == 4) blended = add(fgColor.rgb, bgColor.rgb);
+  else blended = mix(bgColor.rgb, fgColor.rgb, fgColor.a);
+
+  gl_FragColor = vec4(blended, 1.0);
 }
 `;
 
@@ -36,6 +68,7 @@ uniform sampler2D uTexY;
 uniform sampler2D uTexU;
 uniform sampler2D uTexV;
 uniform int uColorspace;
+uniform float     uOpacity;
 varying vec2 vTexCoord;
 
 void main() {
@@ -61,7 +94,7 @@ void main() {
         b = 1.164 * y + 2.017 * u;
     }
 
-    gl_FragColor = vec4(clamp(r, 0.0, 1.0), clamp(g, 0.0, 1.0), clamp(b, 0.0, 1.0), 1.0);
+    gl_FragColor = vec4(clamp(r, 0.0, 1.0), clamp(g, 0.0, 1.0), clamp(b, 0.0, 1.0), uOpacity);
 }
 `;
 
@@ -95,7 +128,7 @@ export class Player {
 
     const gl = canvas.getContext('webgl', {
       antialias: false,
-      alpha:     false,
+      alpha:     true,
       depth:     false,
       stencil:   false,
     });
@@ -107,13 +140,45 @@ export class Player {
     // driver-side reallocation every frame for 4K sources.
     this._textureInitialized     = false;
     this._rgbaTextureInitialized = false;
+    this._lastYuvWidth = 0;      // Track last YUV dimensions for safety checks
+    this._lastYuvHeight = 0;
 
     // Sequence mode: when true, canvas is locked to sequence resolution
     this._seqMode = false;
     this._seqW    = 0;
     this._seqH    = 0;
 
+    // FBO infrastructure for blend modes (initialized on demand)
+    this._fboPool = [];           // Pool of FBOs for layer rendering
+    this._currentFboCount = 0;
+
     this._initGL();
+  }
+
+  _createFBO(width, height) {
+    const gl = this.gl;
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+
+    const tex = this._createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { fbo, tex };
+  }
+
+  _ensureFBOsForSize(width, height) {
+    // Pre-allocate FBOs for the sequence size (up to 4 layers)
+    while (this._fboPool.length < 4) {
+      this._fboPool.push(this._createFBO(width, height));
+    }
+  }
+
+  _needsFBO(blendMode) {
+    // Blend modes 1-4 need FBO rendering (multiply, screen, overlay, add)
+    return blendMode > 0 && blendMode <= 4;
   }
 
   _createTexture() {
@@ -155,6 +220,7 @@ export class Player {
     this.loc_texU       = gl.getUniformLocation(this.prog, 'uTexU');
     this.loc_texV       = gl.getUniformLocation(this.prog, 'uTexV');
     this._uColorspace   = gl.getUniformLocation(this.prog, 'uColorspace');
+    this._uOpacity      = gl.getUniformLocation(this.prog, 'uOpacity');
 
     // ── Three LUMINANCE textures for Y, U, V planes ──────────────────────
     this.textureY = this._createTexture();
@@ -168,12 +234,28 @@ export class Player {
     this.locRgba_scale = gl.getUniformLocation(this.progRgba, 'u_scale');
     this.locRgba_offset= gl.getUniformLocation(this.progRgba, 'u_offset');
     this.locRgba_tex   = gl.getUniformLocation(this.progRgba, 'uTex');
+    this._uOpacityRgba = gl.getUniformLocation(this.progRgba, 'uOpacity');
     this.textureRgba   = this._createTexture();
+
+    // ── Blend mode compositor program ────────────────────────────────────────
+    this.progBlend     = createProgram(gl, VERT_SRC, FRAG_SRC_BLEND);
+    this.locBlend_pos  = gl.getAttribLocation (this.progBlend, 'a_pos');
+    this.locBlend_uv   = gl.getAttribLocation (this.progBlend, 'a_uv');
+    this.locBlend_fbo  = gl.getUniformLocation(this.progBlend, 'uFbo');
+    this.locBlend_bg   = gl.getUniformLocation(this.progBlend, 'uBackground');
+    this.locBlend_mode = gl.getUniformLocation(this.progBlend, 'uBlendMode');
 
     // Without UNPACK_ALIGNMENT=1, WebGL pads each row to a 4-byte boundary.
     // For odd-width chroma planes (e.g. 1920-wide U/V at 4K) that causes
     // corrupted textures.  Setting 1 means no implicit padding.
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+
+    // Enable WebGL blending for compositing multiple layers
+    gl.enable(gl.BLEND);
+    gl.blendFuncSeparate(
+      gl.SRC_ALPHA,           gl.ONE_MINUS_SRC_ALPHA,  // RGB: over compositing
+      gl.ONE,                  gl.ONE_MINUS_SRC_ALPHA   // Alpha: accumulate correctly
+    );
 
     gl.clearColor(0, 0, 0, 1);
   }
@@ -246,6 +328,8 @@ export class Player {
     this.gl.viewport(0, 0, seqW, seqH);
     this._textureInitialized = false;
     this._rgbaTextureInitialized = false;
+    this._lastYuvWidth = 0;  // Reset dimension tracking
+    this._lastYuvHeight = 0;
   }
 
   /**
@@ -276,9 +360,9 @@ export class Player {
    * Does not resize canvas or call clear(). Caller is responsible for calling
    * clear() before the first drawFrameAt, and for setting uniforms correctly.
    * @param {object} frameData — { y, u, v, width, height, ... } or { bitmap, width, height, ... }
-   * @param {object} transform — { scaleX, scaleY, offsetX, offsetY }
+   * @param {object} transform — { scaleX, scaleY, offsetX, offsetY, opacity }
    */
-  drawFrameAt(frameData, { scaleX = 1, scaleY = 1, offsetX = 0, offsetY = 0 } = {}) {
+  drawFrameAt(frameData, { scaleX = 1, scaleY = 1, offsetX = 0, offsetY = 0, opacity = 1.0 } = {}) {
     // Upload textures (mirrors _drawYUV/_drawBitmap setup)
     if (frameData?.bitmap) {
       this._uploadBitmap(frameData.bitmap, frameData.width, frameData.height);
@@ -287,6 +371,7 @@ export class Player {
       gl.useProgram(this.progRgba);
       gl.uniform2f(this.locRgba_scale, scaleX, scaleY);
       gl.uniform2f(this.locRgba_offset, offsetX, offsetY);
+      gl.uniform1f(this._uOpacityRgba, opacity);
 
       gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
       const stride = 4 * 4;
@@ -308,6 +393,7 @@ export class Player {
       gl.uniform1i(this._uColorspace, frameData.colorspace ?? 0);
       gl.uniform2f(this.loc_scale, scaleX, scaleY);
       gl.uniform2f(this.loc_offset, offsetX, offsetY);
+      gl.uniform1f(this._uOpacity, opacity);
 
       gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
       const stride = 4 * 4;
@@ -375,6 +461,7 @@ export class Player {
 
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.useProgram(this.progRgba);
+    gl.uniform1f(this._uOpacityRgba, 1.0);
     // Default scale (1,1) and offset (0,0) for fullscreen
     gl.uniform2f(this.locRgba_scale, 1.0, 1.0);
     gl.uniform2f(this.locRgba_offset, 0.0, 0.0);
@@ -399,7 +486,14 @@ export class Player {
    * @param {{ y, u, v, width, height, strideY, strideU, strideV }} frame
    */
   _uploadYUV({ y, u, v, width, height, strideY, strideU, strideV }) {
-    const isUpdate = this._textureInitialized;
+    // Safety check: if frame dimensions changed, force reallocation
+    let isUpdate = this._textureInitialized;
+    if (width !== this._lastYuvWidth || height !== this._lastYuvHeight) {
+      isUpdate = false;  // Force texImage2D reallocation
+      this._lastYuvWidth = width;
+      this._lastYuvHeight = height;
+    }
+
     this._uploadPlane(this.textureY, y, width,    height,    strideY, isUpdate);
     this._uploadPlane(this.textureU, u, width>>1, height>>1, strideU, isUpdate);
     this._uploadPlane(this.textureV, v, width>>1, height>>1, strideV, isUpdate);
@@ -434,6 +528,7 @@ export class Player {
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.useProgram(this.prog);
     gl.uniform1i(this._uColorspace, colorspace);
+    gl.uniform1f(this._uOpacity, 1.0);
     // Default scale (1,1) and offset (0,0) for fullscreen
     gl.uniform2f(this.loc_scale, 1.0, 1.0);
     gl.uniform2f(this.loc_offset, 0.0, 0.0);

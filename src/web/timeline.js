@@ -160,6 +160,14 @@ export class Timeline {
     return RULER_H + idx * (TRACK_H + TRACK_GAP) - this._scrollY;
   }
 
+  /** Get all tracks with video tracks reversed (V1 at bottom) */
+  _getAllTracks(seq) {
+    if (!seq) return [];
+    const videoTracks = (seq.video_tracks || []).map((t) => ({ ...t, isVideo: true }));
+    const audioTracks = (seq.audio_tracks || []).map((t) => ({ ...t, isVideo: false }));
+    return [...videoTracks.reverse(), ...audioTracks];
+  }
+
   /** canvas y → track index (or -1 if in ruler/header) */
   _yToTrackIdx(y) {
     if (y < RULER_H) return -1;
@@ -300,10 +308,7 @@ export class Timeline {
   }
 
   _drawTracks(ctx, seq, w, h) {
-    const allTracks = [
-      ...(seq.video_tracks || []).map((t) => ({ ...t, isVideo: true })),
-      ...(seq.audio_tracks || []).map((t) => ({ ...t, isVideo: false })),
-    ];
+    const allTracks = this._getAllTracks(seq);
 
     allTracks.forEach((track, idx) => {
       const y = this._trackY(idx);
@@ -378,10 +383,7 @@ export class Timeline {
 
     if (!seq) return;
 
-    const allTracks = [
-      ...(seq.video_tracks || []).map((t) => ({ ...t, isVideo: true })),
-      ...(seq.audio_tracks || []).map((t) => ({ ...t, isVideo: false })),
-    ];
+    const allTracks = this._getAllTracks(seq);
 
     allTracks.forEach((track, idx) => {
       const y = this._trackY(idx);
@@ -701,10 +703,7 @@ export class Timeline {
     const seq = this._engine._sequences?.get(this._seqId);
     if (!seq) return null;
 
-    const allTracks = [
-      ...(seq.video_tracks || []).map((t) => ({ ...t, isVideo: true })),
-      ...(seq.audio_tracks || []).map((t) => ({ ...t, isVideo: false })),
-    ];
+    const allTracks = this._getAllTracks(seq);
     if (trackIdx >= allTracks.length) return null;
 
     const track = allTracks[trackIdx];

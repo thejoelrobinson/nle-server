@@ -118,7 +118,7 @@
     <!-- Second vertical divider (same --col-w, keeps columns aligned) -->
     <div class="divider-v" id="divider-col-2"></div>
 
-    <!-- Timeline (bottom-right) -->
+    <!-- Timeline (bottom-right-left) -->
     <div id="timeline-panel" class="panel">
       <div class="panel-header">
         <span class="panel-title">Timeline</span>
@@ -131,6 +131,82 @@
         </div>
       </div>
       <canvas id="timeline-canvas"></canvas>
+    </div>
+
+    <!-- Third vertical divider -->
+    <div class="divider-v" id="divider-col-3" style="display:none;"></div>
+
+    <!-- Inspector Panel (bottom-right) -->
+    <div id="inspector-panel" class="panel" style="display:none;flex-direction:column;overflow-y:auto;">
+      <div class="panel-header">
+        <span class="panel-title">Inspector</span>
+      </div>
+      <div id="inspector-content" style="padding:12px;display:flex;flex-direction:column;gap:12px;">
+        <!-- Opacity Control -->
+        <div class="inspector-group">
+          <label for="inspector-opacity">Opacity:</label>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <input type="range" id="inspector-opacity" min="0" max="100" value="100" style="flex:1;">
+            <span id="inspector-opacity-value" style="min-width:35px;text-align:right;">100%</span>
+          </div>
+        </div>
+
+        <!-- Position Controls -->
+        <fieldset style="border:1px solid #555;padding:8px;border-radius:4px;">
+          <legend style="font-size:11px;font-weight:bold;color:#aaa;">Position</legend>
+          <div class="inspector-group" style="margin-bottom:8px;">
+            <label for="inspector-pos-x">X:</label>
+            <input type="number" id="inspector-pos-x" value="0" step="1" style="width:100%;padding:4px;">
+          </div>
+          <div class="inspector-group">
+            <label for="inspector-pos-y">Y:</label>
+            <input type="number" id="inspector-pos-y" value="0" step="1" style="width:100%;padding:4px;">
+          </div>
+        </fieldset>
+
+        <!-- Scale Controls -->
+        <fieldset style="border:1px solid #555;padding:8px;border-radius:4px;">
+          <legend style="font-size:11px;font-weight:bold;color:#aaa;">Scale</legend>
+          <div class="inspector-group">
+            <label for="inspector-scale">Uniform Scale:</label>
+            <div style="display:flex;gap:8px;align-items:center;">
+              <input type="range" id="inspector-scale" min="10" max="200" value="100" step="1" style="flex:1;">
+              <span id="inspector-scale-value" style="min-width:35px;text-align:right;">100%</span>
+            </div>
+          </div>
+        </fieldset>
+
+        <!-- Anchor Point Controls -->
+        <fieldset style="border:1px solid #555;padding:8px;border-radius:4px;">
+          <legend style="font-size:11px;font-weight:bold;color:#aaa;">Anchor</legend>
+          <div class="inspector-group" style="margin-bottom:8px;">
+            <label for="inspector-anchor-x">X:</label>
+            <input type="number" id="inspector-anchor-x" value="0.5" min="0" max="1" step="0.1" style="width:100%;padding:4px;">
+          </div>
+          <div class="inspector-group">
+            <label for="inspector-anchor-y">Y:</label>
+            <input type="number" id="inspector-anchor-y" value="0.5" min="0" max="1" step="0.1" style="width:100%;padding:4px;">
+          </div>
+        </fieldset>
+
+        <!-- Blend Mode Control -->
+        <div class="inspector-group">
+          <label for="inspector-blend-mode">Blend Mode:</label>
+          <select id="inspector-blend-mode" style="width:100%;padding:4px;background:#333;color:#fff;border:1px solid #555;">
+            <option value="0">Normal</option>
+            <option value="1">Multiply</option>
+            <option value="2">Screen</option>
+            <option value="3">Overlay</option>
+            <option value="4">Add</option>
+          </select>
+        </div>
+
+        <!-- No Selection Message -->
+        <div id="inspector-empty" style="padding:20px;text-align:center;color:#777;font-size:13px;">
+          <p>No clip selected</p>
+          <p style="margin-top:8px;font-size:11px;">Select a clip to edit properties</p>
+        </div>
+      </div>
     </div>
 
   </div><!-- /bottom-row -->

@@ -295,6 +295,47 @@ bool TimelineEngine::remove_clip(const std::string& clip_id) {
 }
 
 // ---------------------------------------------------------------------------
+// Clip properties
+// ---------------------------------------------------------------------------
+
+bool TimelineEngine::set_clip_opacity(const std::string& clip_id, float opacity) {
+    ClipRef* clip = find_clip_ref(clip_id);
+    if (!clip) return false;
+    clip->opacity = std::max(0.0f, std::min(1.0f, opacity));
+    return true;
+}
+
+bool TimelineEngine::set_clip_position(const std::string& clip_id, float posX, float posY) {
+    ClipRef* clip = find_clip_ref(clip_id);
+    if (!clip) return false;
+    clip->posX = posX;
+    clip->posY = posY;
+    return true;
+}
+
+bool TimelineEngine::set_clip_scale(const std::string& clip_id, float userScale) {
+    ClipRef* clip = find_clip_ref(clip_id);
+    if (!clip) return false;
+    clip->userScale = std::max(0.1f, userScale);  // Prevent zero/negative scale
+    return true;
+}
+
+bool TimelineEngine::set_clip_anchor(const std::string& clip_id, float anchorX, float anchorY) {
+    ClipRef* clip = find_clip_ref(clip_id);
+    if (!clip) return false;
+    clip->anchorX = std::max(0.0f, std::min(1.0f, anchorX));
+    clip->anchorY = std::max(0.0f, std::min(1.0f, anchorY));
+    return true;
+}
+
+bool TimelineEngine::set_clip_blend_mode(const std::string& clip_id, int blendMode) {
+    ClipRef* clip = find_clip_ref(clip_id);
+    if (!clip) return false;
+    clip->blendMode = std::max(0, std::min(4, blendMode));  // Clamp to valid range
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Track management
 // ---------------------------------------------------------------------------
 
@@ -319,6 +360,22 @@ bool TimelineEngine::set_track_locked(const std::string& seq_id,
     Track* t = find_track(seq_id, track_index, TrackType::VIDEO);
     if (!t) return false;
     t->locked = v;
+    return true;
+}
+
+bool TimelineEngine::set_track_opacity(const std::string& seq_id,
+                                        int track_index, float opacity) {
+    Track* t = find_track(seq_id, track_index, TrackType::VIDEO);
+    if (!t) return false;
+    t->opacity = std::max(0.0f, std::min(1.0f, opacity));
+    return true;
+}
+
+bool TimelineEngine::set_track_solo(const std::string& seq_id,
+                                     int track_index, bool v) {
+    Track* t = find_track(seq_id, track_index, TrackType::VIDEO);
+    if (!t) return false;
+    t->solo = v;
     return true;
 }
 
@@ -358,6 +415,51 @@ emscripten::val TimelineEngine::resolve_frame(const std::string& seq_id,
         }
     }
     return emscripten::val::null();
+}
+
+emscripten::val TimelineEngine::resolve_all_frames(const std::string& seq_id,
+                                                    int64_t timeline_pts) {
+    auto sit = sequences_.find(seq_id);
+    if (sit == sequences_.end()) return emscripten::val::array();
+
+    const Sequence& seq = sit->second;
+    emscripten::val result = emscripten::val::array();
+    int push_idx = 0;
+
+    // Bottom-to-top (index 0 first) for painter's algorithm
+    for (size_t i = 0; i < seq.video_tracks.size(); i++) {
+        const Track& t = seq.video_tracks[i];
+        if (!t.visible || t.muted) continue;
+
+        for (const auto& c : t.clips) {
+            if (timeline_pts >= c.timeline_in_pts && timeline_pts < c.timeline_out_pts) {
+                // Rescale to clip timebase
+                int64_t offset_seq = timeline_pts - c.timeline_in_pts;
+                int64_t offset_clip = av_rescale_q(
+                    offset_seq,
+                    AVRational{1, 1000000},
+                    AVRational{c.tb_num, c.tb_den}
+                );
+                int64_t source_pts = c.source_in_pts + offset_clip;
+
+                emscripten::val entry = emscripten::val::object();
+                entry.set("source_path", emscripten::val(c.source_path));
+                entry.set("source_pts",  emscripten::val(static_cast<double>(source_pts)));
+                entry.set("colorspace",  emscripten::val(c.colorspace));
+                entry.set("opacity",     emscripten::val(c.opacity * t.opacity));  // Combine clip + track opacity
+                entry.set("posX",        emscripten::val(c.posX));
+                entry.set("posY",        emscripten::val(c.posY));
+                entry.set("anchorX",     emscripten::val(c.anchorX));
+                entry.set("anchorY",     emscripten::val(c.anchorY));
+                entry.set("userScale",   emscripten::val(c.userScale));
+                entry.set("blendMode",   emscripten::val(c.blendMode));
+                entry.set("clip_id",     emscripten::val(c.clip_id));
+                result.set(push_idx++, entry);
+                break; // one clip per track per PTS
+            }
+        }
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -400,7 +502,14 @@ nlohmann::json TimelineEngine::clip_to_json(const ClipRef& c) const {
         {"tb_den",           c.tb_den},
         {"color_primaries",  c.color_primaries},
         {"color_trc",        c.color_trc},
-        {"colorspace",       c.colorspace}
+        {"colorspace",       c.colorspace},
+        {"opacity",          c.opacity},
+        {"posX",             c.posX},
+        {"posY",             c.posY},
+        {"anchorX",          c.anchorX},
+        {"anchorY",          c.anchorY},
+        {"userScale",        c.userScale},
+        {"blendMode",        c.blendMode}
     };
 }
 
@@ -413,6 +522,8 @@ nlohmann::json TimelineEngine::track_to_json(const Track& t) const {
         {"muted",   t.muted},
         {"locked",  t.locked},
         {"visible", t.visible},
+        {"solo",    t.solo},
+        {"opacity", t.opacity},
         {"clips",   clips_arr}
     };
 }
@@ -433,6 +544,13 @@ ClipRef TimelineEngine::json_to_clip(const nlohmann::json& j) const {
     c.color_primaries  = j.value("color_primaries", 1);
     c.color_trc        = j.value("color_trc", 1);
     c.colorspace       = j.value("colorspace", 5);
+    c.opacity          = j.value("opacity", 1.0f);
+    c.posX             = j.value("posX", 0.0f);
+    c.posY             = j.value("posY", 0.0f);
+    c.anchorX          = j.value("anchorX", 0.5f);
+    c.anchorY          = j.value("anchorY", 0.5f);
+    c.userScale        = j.value("userScale", 1.0f);
+    c.blendMode        = j.value("blendMode", 0);
     return c;
 }
 
@@ -444,6 +562,8 @@ Track TimelineEngine::json_to_track(const nlohmann::json& j, TrackType type) con
     t.muted   = j.value("muted",   false);
     t.locked  = j.value("locked",  false);
     t.visible = j.value("visible", true);
+    t.solo    = j.value("solo",    false);
+    t.opacity = j.value("opacity", 1.0f);
     for (const auto& cj : j.at("clips"))
         t.clips.push_back(json_to_clip(cj));
     return t;
