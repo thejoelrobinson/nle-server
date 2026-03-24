@@ -66,12 +66,12 @@ export function initMediaBin() {
     return srcPlayer;
   }
 
-  function renderSourceFrame(pts) {
+  async function renderSourceFrame(pts) {
     const { pool } = window._nle ?? {};
     if (!pool) return;
     const clip = clips[activeIdx];
     if (!clip) return;
-    const frame = pool.decodeFrameAt(clip.file.name, pts);
+    const frame = await pool.decodeFrameAt(clip.file.name, pts);
     if (frame && ensureSrcPlayer()) srcPlayer.drawFrame(frame);
     if (sourceTc) sourceTc.textContent = formatTimecode(pts, srcFps);
   }
@@ -130,7 +130,7 @@ export function initMediaBin() {
       .forEach((b) => { if (b) b.disabled = false; });
 
     renderBinList();
-    renderSourceFrame(0);
+    await renderSourceFrame(0);
   }
 
   // ── Codec + resolution badge helpers ──────────────────────────────────
