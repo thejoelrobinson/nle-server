@@ -244,7 +244,9 @@ export class Playback {
       ? this._cache.get(resolved.source_path, roundedPts)
       : null;
 
-    console.log('[_tick] pts:', Math.round(this._playheadPts), '| src:', resolved?.source_path ?? 'null', '| cacheKey:', roundedPts, '| hit:', !!frame, '| hasPlayer:', !!this._player); // eslint-disable-line no-console
+    if (this._tickCount % 60 === 0) {
+      console.log(`[_tick#${this._tickCount}] pts=${Math.round(this._playheadPts)} seqId=${this._seqId} resolved=${!!resolved} hit=${!!frame} player=${!!this._player}`); // eslint-disable-line no-console
+    }
 
     if (resolved?.source_path && this._player) {
       if (frame) {
@@ -272,7 +274,7 @@ export class Playback {
     this._onTimecode?.(this._playheadPts);
 
     // ── Audio (throttled inside _decodeAndPushAudio) ──────────────────────
-    this._decodeAndPushAudio(this._playheadPts, resolved);
+    setTimeout(() => this._decodeAndPushAudio(this._playheadPts, resolved).catch(() => {}), 0);
 
     // Stop at end of sequence
     if (this._duration > 0 && this._playheadPts >= this._duration) {

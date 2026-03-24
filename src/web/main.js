@@ -125,6 +125,9 @@ function initTimeline() {
     onTimecodeUpdate:  updateTimecodeDisplay,
     onFrameState:      (hasFrame) => setProgramEmpty(!hasFrame),
   });
+  window.__pb     = playback;
+  window.__pool   = pool;
+  window.__engine = _engine;
 
   // When the user scrubs the playhead, pause and sync the Playback engine.
   canvas.addEventListener('playhead-change', (e) => {
@@ -243,6 +246,7 @@ async function importFileToTimeline(file, trackIndex = 0, srcInPts = 0, srcOutPt
 btnPlayPause.addEventListener('click', () => {
   // Ensure GL player is initialised before the first play (user-gesture context).
   initPlayer();
+  if (_seqId) playback.setSequenceId?.(_seqId);
   playback?.toggle();
 });
 btnStepBack.addEventListener('click',  () => { playback?.stepBack(); });
