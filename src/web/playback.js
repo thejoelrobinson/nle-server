@@ -95,6 +95,10 @@ export class Playback {
     this._frameDurMs  = 1000 / this._fps;  // ms per frame
     this._duration    = duration;           // µs
 
+    // Sequence dimensions for true-size rendering
+    this._seqW        = width;
+    this._seqH        = height;
+
     this._cache = new FrameCache(computeCacheSize(width, height));
 
     this._isPlaying   = false;
@@ -132,7 +136,11 @@ export class Playback {
 
   setDuration(durMicros) { this._duration = durMicros; }
   setSequenceId(id)      { this._seqId    = id; }
-  setProgramPlayer(p)    { this._player   = p; }
+  setSequenceSize(w, h)  { this._seqW = w; this._seqH = h; this._player?.setSequenceMode(w, h); }
+  setProgramPlayer(p)    {
+    this._player   = p;
+    if (p) p.setSequenceMode(this._seqW, this._seqH);
+  }
 
   // ── Transport ─────────────────────────────────────────────────────────────
 
@@ -204,6 +212,24 @@ export class Playback {
   // ── Internal helpers ─────────────────────────────────────────────────────
 
   /**
+   * Compute transform (scale + offset) for a clip based on its native dimensions.
+   * @param {string} sourcePath
+   * @param {object} resolved — result from resolve_all_frames with posX, posY, userScale
+   * @returns {object} { scaleX, scaleY, offsetX, offsetY }
+   */
+  _computeTransform(sourcePath, resolved) {
+    const info   = this._pool.getInfo(sourcePath);
+    const clipW  = info?.width  ?? this._seqW;
+    const clipH  = info?.height ?? this._seqH;
+    const scaleX = (clipW / this._seqW) * (resolved.userScale ?? 1.0);
+    const scaleY = (clipH / this._seqH) * (resolved.userScale ?? 1.0);
+    // Position in NDC (posX/posY are pixels from sequence center; NDC Y is inverted)
+    const offsetX =  (resolved.posX ?? 0) / (this._seqW / 2);
+    const offsetY = -(resolved.posY ?? 0) / (this._seqH / 2);
+    return { scaleX, scaleY, offsetX, offsetY };
+  }
+
+  /**
    * Update timeline display without firing 'playhead-change' event.
    * Directly mutates timeline internal state to avoid triggering scrub listener.
    * @param {number} pts — playhead position in µs
@@ -231,29 +257,38 @@ export class Playback {
     this._playheadPts += elapsed * 1000;
     if (this._duration > 0) this._playheadPts = Math.min(this._playheadPts, this._duration);
 
-    // Resolve frame mapping once (reused for display and audio below).
-    const resolved = this._engine && this._seqId
-      ? this._engine.resolve_frame(this._seqId, this._playheadPts)
-      : null;
+    // Resolve all clips under the playhead (bottom-to-top compositing order)
+    const allResolved = this._engine && this._seqId
+      ? this._engine.resolve_all_frames(this._seqId, this._playheadPts)
+      : [];
 
     // ── Draw (cache-first; trigger async decode on miss) ──────────────────
-    if (resolved?.source_path && this._player) {
-      const sourcePts = Math.round(resolved.source_pts);
-      const frame = this._cache.get(resolved.source_path, sourcePts);
+    if (allResolved.length === 0) {
+      // No clips under playhead — clear canvas to black
+      if (this._player) this._player.clear();
+      this._onFrameState?.(false);
+    } else if (this._player) {
+      // Check if all clips are in cache
+      const allCached = allResolved.every((resolved) => {
+        const sourcePts = Math.round(resolved.source_pts);
+        return this._cache.get(resolved.source_path, sourcePts) !== null;
+      });
 
-      if (frame) {
-        // Cache hit — colorspace: only look up when source file changes
-        if (resolved.source_path !== this._lastResolvedSourcePath) {
-          this._lastResolvedSourcePath = resolved.source_path;
-          const info = this._pool.getInfo(resolved.source_path);
-          this._lastColorspace = mapFFmpegColorspace(info?.colorspace ?? AVCOL_SPC_BT709);
-        }
-        this._player.drawFrame({ ...frame, colorspace: this._lastColorspace });
+      if (allCached) {
+        // All clips cached — composite them
+        this._player.clear();
+        allResolved.forEach((resolved) => {
+          const sourcePts = Math.round(resolved.source_pts);
+          const frame = this._cache.get(resolved.source_path, sourcePts);
+          if (frame) {
+            const transform = this._computeTransform(resolved.source_path, resolved);
+            this._player.drawFrameAt({ ...frame, colorspace: mapFFmpegColorspace(this._pool.getInfo(resolved.source_path)?.colorspace ?? AVCOL_SPC_BT709) }, transform);
+          }
+        });
         this._onFrameState?.(true);
       } else {
-        // Cache miss — fire async decode; on the WASM path this resolves as a
-        // microtask (before the next rAF tick), so the frame draws immediately.
-        this._decodeAndDisplay(this._playheadPts, resolved);
+        // Cache miss — fire async decode
+        this._decodeAndDisplay(this._playheadPts, allResolved);
       }
     }
 
@@ -268,7 +303,11 @@ export class Playback {
     this._onTimecode?.(this._playheadPts);
 
     // ── Audio (throttled inside _decodeAndPushAudio) ──────────────────────
-    setTimeout(() => this._decodeAndPushAudio(this._playheadPts, resolved), 0);
+    // Use the top-priority clip for audio (first entry when resolve_frame is called)
+    const topClip = this._engine && this._seqId
+      ? this._engine.resolve_frame(this._seqId, this._playheadPts)
+      : null;
+    setTimeout(() => this._decodeAndPushAudio(this._playheadPts, topClip), 0);
 
     // Stop at end of sequence
     if (this._duration > 0 && this._playheadPts >= this._duration) {
@@ -310,34 +349,36 @@ export class Playback {
         const targetPts = pts + i * frameDuration;
         if (this._duration > 0 && targetPts > this._duration) break;
 
-        const resolved = this._engine?.resolve_frame(this._seqId, targetPts);
-        if (!resolved?.source_path) continue;
-        const sourcePts = Math.round(resolved.source_pts);
-        if (this._cache.has(resolved.source_path, sourcePts)) continue;
+        // Decode all clips at this pts
+        const allResolved = this._engine?.resolve_all_frames(this._seqId, targetPts) ?? [];
+        for (const resolved of allResolved) {
+          const sourcePts = Math.round(resolved.source_pts);
+          if (this._cache.has(resolved.source_path, sourcePts)) continue;
 
-        // decodeFrameAt is async on both the WebCodecs and WASM paths.
-        // Wrap in try/catch: any decode error must NOT kill the loop — a
-        // single bad frame should be skipped, not crash the entire prefetch.
-        let frameData;
-        try {
-          frameData = await this._pool.decodeFrameAt(
-            resolved.source_path,
-            usToSecs(resolved.source_pts)
-          );
-        } catch (e) {
-          console.warn('[Playback] _decodeLoop decode error (skipping frame):', e); // eslint-disable-line no-console
-          continue;
-        }
-        if (!frameData) continue;
+          // decodeFrameAt is async on both the WebCodecs and WASM paths.
+          // Wrap in try/catch: any decode error must NOT kill the loop — a
+          // single bad frame should be skipped, not crash the entire prefetch.
+          let frameData;
+          try {
+            frameData = await this._pool.decodeFrameAt(
+              resolved.source_path,
+              usToSecs(resolved.source_pts)
+            );
+          } catch (e) {
+            console.warn('[Playback] _decodeLoop decode error (skipping frame):', e); // eslint-disable-line no-console
+            continue;
+          }
+          if (!frameData) continue;
 
-        let cached;
-        try {
-          cached = await _toImageBitmapIfNeeded(frameData);
-        } catch (e) {
-          console.warn('[Playback] _decodeLoop bitmap conversion error (skipping frame):', e); // eslint-disable-line no-console
-          continue;
+          let cached;
+          try {
+            cached = await _toImageBitmapIfNeeded(frameData);
+          } catch (e) {
+            console.warn('[Playback] _decodeLoop bitmap conversion error (skipping frame):', e); // eslint-disable-line no-console
+            continue;
+          }
+          if (cached) this._cache.set(resolved.source_path, sourcePts, cached);
         }
-        if (cached) this._cache.set(resolved.source_path, sourcePts, cached);
       }
 
       // Yield to the event loop between decode rounds so rAF callbacks
@@ -367,39 +408,43 @@ export class Playback {
 
   // ── Async decode used for scrub / step (not in rAF) ─────────────────────
 
-  async _decodeAndDisplay(pts, resolved = null) {
+  async _decodeAndDisplay(pts, allResolved = null) {
     if (!this._pool) return;
     try {
-      if (!resolved) {
+      if (!allResolved) {
         if (!this._engine || !this._seqId) return;
-        resolved = this._engine.resolve_frame(this._seqId, pts);
+        allResolved = this._engine.resolve_all_frames(this._seqId, pts);
       }
-      if (!resolved || !resolved.source_path) { this._onFrameState?.(false); return; }
-
-      // Colorspace: only look up when source changes
-      let colorspace = this._lastColorspace;
-      if (resolved.source_path !== this._lastResolvedSourcePath) {
-        this._lastResolvedSourcePath = resolved.source_path;
-        const info = this._pool.getInfo(resolved.source_path);
-        colorspace = mapFFmpegColorspace(info?.colorspace ?? AVCOL_SPC_BT709);
-        this._lastColorspace = colorspace;
+      if (!Array.isArray(allResolved) || allResolved.length === 0) {
+        if (this._player) this._player.clear();
+        this._onFrameState?.(false);
+        return;
       }
 
-      const sourcePts = Math.round(resolved.source_pts);
-      let frame = this._cache.get(resolved.source_path, sourcePts);
-      if (!frame) {
-        const frameData = await this._pool.decodeFrameAt(
-          resolved.source_path,
-          usToSecs(resolved.source_pts)
-        );
-        frame = await _toImageBitmapIfNeeded(frameData);
-        if (frame) this._cache.set(resolved.source_path, sourcePts, frame);
+      // Decode and composite all clips
+      if (this._player) this._player.clear();
+
+      for (const resolved of allResolved) {
+        const sourcePts = Math.round(resolved.source_pts);
+        let frame = this._cache.get(resolved.source_path, sourcePts);
+        if (!frame) {
+          const frameData = await this._pool.decodeFrameAt(
+            resolved.source_path,
+            usToSecs(resolved.source_pts)
+          );
+          frame = await _toImageBitmapIfNeeded(frameData);
+          if (frame) this._cache.set(resolved.source_path, sourcePts, frame);
+        }
+
+        if (frame && this._player) {
+          const info = this._pool.getInfo(resolved.source_path);
+          const colorspace = mapFFmpegColorspace(info?.colorspace ?? AVCOL_SPC_BT709);
+          const transform = this._computeTransform(resolved.source_path, resolved);
+          this._player.drawFrameAt({ ...frame, colorspace }, transform);
+        }
       }
 
-      if (frame && this._player) {
-        this._player.drawFrame({ ...frame, colorspace });
-        this._onFrameState?.(true);
-      }
+      this._onFrameState?.(true);
     } catch (e) {
       console.warn('[Playback] decode error:', e); // eslint-disable-line no-console
     }

@@ -17,7 +17,10 @@ function makeTimeline() {
 }
 
 function makeEngine(resolveResult = null) {
-  return { resolve_frame: vi.fn().mockReturnValue(resolveResult) };
+  return {
+    resolve_frame: vi.fn().mockReturnValue(resolveResult),
+    resolve_all_frames: vi.fn().mockReturnValue(resolveResult ? [resolveResult] : []),
+  };
 }
 
 function makePool(frame = null) {
@@ -25,7 +28,7 @@ function makePool(frame = null) {
 }
 
 function makePlayer() {
-  return { drawFrame: vi.fn() };
+  return { drawFrame: vi.fn(), drawFrameAt: vi.fn(), clear: vi.fn() };
 }
 
 /**

@@ -27,6 +27,7 @@ function createMockGl() {
     LINEAR:              0x2601,
     CLAMP_TO_EDGE:       0x812F,
     LUMINANCE:           0x1909,
+    RGBA:                0x1908,
     UNSIGNED_BYTE:       0x1401,
     FLOAT:               0x1406,
     TRIANGLE_STRIP:      0x0005,
@@ -34,6 +35,7 @@ function createMockGl() {
     TEXTURE1:            0x84C1,
     TEXTURE2:            0x84C2,
     COLOR_BUFFER_BIT:    0x4000,
+    UNPACK_ALIGNMENT:    0x0CF5,
 
     // Buffer
     createBuffer:            obj,
@@ -62,13 +64,16 @@ function createMockGl() {
     bindTexture:             () => {},
     texParameteri:           () => {},
     texImage2D:              () => {},
+    texSubImage2D:           () => {},
     activeTexture:           () => {},
     uniform1i:               () => {},
+    uniform2f:               () => {},
 
     // Draw
     clearColor:              () => {},
     clear:                   () => {},
     viewport:                () => {},
+    pixelStorei:             () => {},
     enableVertexAttribArray: () => {},
     vertexAttribPointer:     () => {},
     drawArrays:              () => {},

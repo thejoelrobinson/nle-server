@@ -10,10 +10,12 @@
 const VERT_SRC = `
 attribute vec2 a_pos;
 attribute vec2 a_uv;
+uniform vec2 u_scale;
+uniform vec2 u_offset;
 varying   vec2 vTexCoord;
 void main() {
   vTexCoord   = a_uv;
-  gl_Position = vec4(a_pos, 0.0, 1.0);
+  gl_Position = vec4(a_pos * u_scale + u_offset, 0.0, 1.0);
 }
 `;
 
@@ -106,6 +108,11 @@ export class Player {
     this._textureInitialized     = false;
     this._rgbaTextureInitialized = false;
 
+    // Sequence mode: when true, canvas is locked to sequence resolution
+    this._seqMode = false;
+    this._seqW    = 0;
+    this._seqH    = 0;
+
     this._initGL();
   }
 
@@ -142,6 +149,8 @@ export class Player {
     this.prog           = createProgram(gl, VERT_SRC, FRAG_SRC);
     this.loc_pos        = gl.getAttribLocation(this.prog, 'a_pos');
     this.loc_uv         = gl.getAttribLocation(this.prog, 'a_uv');
+    this.loc_scale      = gl.getUniformLocation(this.prog, 'u_scale');
+    this.loc_offset     = gl.getUniformLocation(this.prog, 'u_offset');
     this.loc_texY       = gl.getUniformLocation(this.prog, 'uTexY');
     this.loc_texU       = gl.getUniformLocation(this.prog, 'uTexU');
     this.loc_texV       = gl.getUniformLocation(this.prog, 'uTexV');
@@ -156,6 +165,8 @@ export class Player {
     this.progRgba      = createProgram(gl, VERT_SRC, FRAG_SRC_RGBA);
     this.locRgba_pos   = gl.getAttribLocation (this.progRgba, 'a_pos');
     this.locRgba_uv    = gl.getAttribLocation (this.progRgba, 'a_uv');
+    this.locRgba_scale = gl.getUniformLocation(this.progRgba, 'u_scale');
+    this.locRgba_offset= gl.getUniformLocation(this.progRgba, 'u_offset');
     this.locRgba_tex   = gl.getUniformLocation(this.progRgba, 'uTex');
     this.textureRgba   = this._createTexture();
 
@@ -219,12 +230,32 @@ export class Player {
   }
 
   /**
-   * Draw a frame.  Accepts either:
+   * Set the canvas to sequence mode: lock to fixed sequence dimensions.
+   * Called once from Playback when the player is initialized.
+   * @param {number} seqW — sequence width
+   * @param {number} seqH — sequence height
+   */
+  setSequenceMode(seqW, seqH) {
+    this._seqMode = true;
+    this._seqW = seqW;
+    this._seqH = seqH;
+    this.canvas.width = seqW;
+    this.canvas.height = seqH;
+    this.width = seqW;
+    this.height = seqH;
+    this.gl.viewport(0, 0, seqW, seqH);
+    this._textureInitialized = false;
+    this._rgbaTextureInitialized = false;
+  }
+
+  /**
+   * Draw a full-screen frame (legacy auto-resize path for source monitor).
+   * Accepts either:
    *   - YUV path: { y, u, v, width, height, strideY, strideU, strideV, colorspace }
    *   - Bitmap path: { bitmap, width, height } — ImageBitmap from WebCodecs hardware decode
    * @param {object} frameData
    */
-  drawFrame(frameData) {
+  drawFrameFull(frameData) {
     if (frameData?.bitmap) {
       this._drawBitmap(frameData.bitmap, frameData.width, frameData.height);
       return;
@@ -233,8 +264,96 @@ export class Player {
   }
 
   /**
+   * Alias for drawFrameFull (for backward compatibility with existing code/tests).
+   * @deprecated Use drawFrameFull or drawFrameAt instead.
+   */
+  drawFrame(frameData) {
+    return this.drawFrameFull(frameData);
+  }
+
+  /**
+   * Draw a frame with a transform (compositing path for program monitor).
+   * Does not resize canvas or call clear(). Caller is responsible for calling
+   * clear() before the first drawFrameAt, and for setting uniforms correctly.
+   * @param {object} frameData — { y, u, v, width, height, ... } or { bitmap, width, height, ... }
+   * @param {object} transform — { scaleX, scaleY, offsetX, offsetY }
+   */
+  drawFrameAt(frameData, { scaleX = 1, scaleY = 1, offsetX = 0, offsetY = 0 } = {}) {
+    // Upload textures (mirrors _drawYUV/_drawBitmap setup)
+    if (frameData?.bitmap) {
+      this._uploadBitmap(frameData.bitmap, frameData.width, frameData.height);
+      // Use RGBA program
+      const gl = this.gl;
+      gl.useProgram(this.progRgba);
+      gl.uniform2f(this.locRgba_scale, scaleX, scaleY);
+      gl.uniform2f(this.locRgba_offset, offsetX, offsetY);
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
+      const stride = 4 * 4;
+      gl.enableVertexAttribArray(this.locRgba_pos);
+      gl.vertexAttribPointer(this.locRgba_pos, 2, gl.FLOAT, false, stride, 0);
+      gl.enableVertexAttribArray(this.locRgba_uv);
+      gl.vertexAttribPointer(this.locRgba_uv, 2, gl.FLOAT, false, stride, 8);
+
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.textureRgba);
+      gl.uniform1i(this.locRgba_tex, 0);
+
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    } else {
+      this._uploadYUV(frameData);
+      // Use YUV program
+      const gl = this.gl;
+      gl.useProgram(this.prog);
+      gl.uniform1i(this._uColorspace, frameData.colorspace ?? 0);
+      gl.uniform2f(this.loc_scale, scaleX, scaleY);
+      gl.uniform2f(this.loc_offset, offsetX, offsetY);
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
+      const stride = 4 * 4;
+      gl.enableVertexAttribArray(this.loc_pos);
+      gl.vertexAttribPointer(this.loc_pos, 2, gl.FLOAT, false, stride, 0);
+      gl.enableVertexAttribArray(this.loc_uv);
+      gl.vertexAttribPointer(this.loc_uv, 2, gl.FLOAT, false, stride, 8);
+
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.textureY);
+      gl.uniform1i(this.loc_texY, 0);
+
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, this.textureU);
+      gl.uniform1i(this.loc_texU, 1);
+
+      gl.activeTexture(gl.TEXTURE2);
+      gl.bindTexture(gl.TEXTURE_2D, this.textureV);
+      gl.uniform1i(this.loc_texV, 2);
+
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+  }
+
+  /**
+   * Upload RGBA bitmap texture only (no draw, no clear).
+   * For use by both drawFrameFull and drawFrameAt paths.
+   * @param {ImageBitmap} bitmap
+   * @param {number} width
+   * @param {number} height
+   */
+  _uploadBitmap(bitmap, width, height) {
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, this.textureRgba);
+    if (this._rgbaTextureInitialized) {
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+    } else {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+      this._rgbaTextureInitialized = true;
+    }
+  }
+
+  /**
    * Draw a pre-decoded RGBA ImageBitmap via the pass-through WebGL program.
    * Uses texSubImage2D for same-size frames (no GPU realloc).
+   * This is the legacy auto-resize path for the source monitor.
    * @param {ImageBitmap} bitmap
    * @param {number} width
    * @param {number} height
@@ -252,16 +371,13 @@ export class Player {
       this._textureInitialized     = false;   // YUV textures now wrong size too
     }
 
-    gl.bindTexture(gl.TEXTURE_2D, this.textureRgba);
-    if (this._rgbaTextureInitialized) {
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
-    } else {
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
-      this._rgbaTextureInitialized = true;
-    }
+    this._uploadBitmap(bitmap, width, height);
 
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.useProgram(this.progRgba);
+    // Default scale (1,1) and offset (0,0) for fullscreen
+    gl.uniform2f(this.locRgba_scale, 1.0, 1.0);
+    gl.uniform2f(this.locRgba_offset, 0.0, 0.0);
 
     gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
     const stride = 4 * 4;
@@ -278,7 +394,20 @@ export class Player {
   }
 
   /**
-   * Upload a YUV420P frame and draw it.
+   * Upload YUV planes only (no draw, no clear).
+   * For use by both drawFrameFull and drawFrameAt paths.
+   * @param {{ y, u, v, width, height, strideY, strideU, strideV }} frame
+   */
+  _uploadYUV({ y, u, v, width, height, strideY, strideU, strideV }) {
+    const isUpdate = this._textureInitialized;
+    this._uploadPlane(this.textureY, y, width,    height,    strideY, isUpdate);
+    this._uploadPlane(this.textureU, u, width>>1, height>>1, strideU, isUpdate);
+    this._uploadPlane(this.textureV, v, width>>1, height>>1, strideV, isUpdate);
+    this._textureInitialized = true;
+  }
+
+  /**
+   * Draw a YUV420P frame (legacy auto-resize path for source monitor).
    * @param {{ y, u, v, width, height, strideY, strideU, strideV, colorspace }} frame
    */
   _drawYUV({ y, u, v, width, height, strideY, strideU, strideV, colorspace = 0 }) {
@@ -299,16 +428,15 @@ export class Player {
 
     // Upload the three planes.  Use texSubImage2D (no GPU realloc) for
     // same-size frames after the first upload.
-    const isUpdate = this._textureInitialized;
-    this._uploadPlane(this.textureY, y, width,    height,    strideY, isUpdate);
-    this._uploadPlane(this.textureU, u, width>>1, height>>1, strideU, isUpdate);
-    this._uploadPlane(this.textureV, v, width>>1, height>>1, strideV, isUpdate);
-    this._textureInitialized = true;
+    this._uploadYUV({ y, u, v, width, height, strideY, strideU, strideV });
 
     // Draw
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.useProgram(this.prog);
     gl.uniform1i(this._uColorspace, colorspace);
+    // Default scale (1,1) and offset (0,0) for fullscreen
+    gl.uniform2f(this.loc_scale, 1.0, 1.0);
+    gl.uniform2f(this.loc_offset, 0.0, 0.0);
 
     gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
     const stride = 4 * 4; // 4 floats per vertex

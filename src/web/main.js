@@ -114,6 +114,7 @@ function initTimeline() {
   _timeline = new Timeline(canvas, _engine, _seqId, 24, 1);
   _timeline.setPool(pool);
 
+  const _initSeq = _engine._sequences.get(_seqId);
   playback = new Playback({
     timeline:          _timeline,
     engine:            _engine,
@@ -121,6 +122,8 @@ function initTimeline() {
     sequenceId:        _seqId,
     fps:               seqFps,
     duration:          _engine.get_sequence_duration?.(_seqId) ?? 0,
+    width:             _initSeq?.width ?? 1920,
+    height:            _initSeq?.height ?? 1080,
     onPlayStateChange: updatePlayButton,
     onTimecodeUpdate:  updateTimecodeDisplay,
     onFrameState:      (hasFrame) => setProgramEmpty(!hasFrame),
@@ -536,6 +539,33 @@ function _buildJsMirrorEngine() {
         }
       }
       return null;
+    }
+
+    resolve_all_frames(seqId, pts) {
+      const seq = this._sequences.get(seqId);
+      if (!seq) return [];
+      const result = [];
+      // Iterate bottom-to-top (0 to length-1) for correct compositing order
+      for (let i = 0; i < seq.video_tracks.length; i++) {
+        const t = seq.video_tracks[i];
+        if (!t.visible || t.muted) continue;
+        for (const c of t.clips) {
+          if (pts >= c.timeline_in_pts && pts < c.timeline_out_pts) {
+            result.push({
+              source_path: c.source_path,
+              source_pts: c.source_in_pts + (pts - c.timeline_in_pts),
+              colorspace: c.colorspace ?? 5,
+              posX: c.posX ?? 0,
+              posY: c.posY ?? 0,
+              anchorX: c.anchorX ?? 0.5,
+              anchorY: c.anchorY ?? 0.5,
+              userScale: c.userScale ?? 1.0,
+            });
+            break; // Only one clip per track at a given time
+          }
+        }
+      }
+      return result;
     }
 
     get_sequence_duration(seqId) {

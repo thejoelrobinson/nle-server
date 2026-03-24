@@ -72,7 +72,7 @@ export function initMediaBin() {
     const clip = clips[activeIdx];
     if (!clip) return;
     const frame = await pool.decodeFrameAt(clip.file.name, pts);
-    if (frame && ensureSrcPlayer()) srcPlayer.drawFrame(frame);
+    if (frame && ensureSrcPlayer()) srcPlayer.drawFrameFull(frame);
     if (sourceTc) sourceTc.textContent = formatTimecode(pts, srcFps);
   }
 
