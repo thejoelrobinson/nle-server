@@ -559,6 +559,14 @@ export class Player {
     this.gl.clear(this.gl.COLOR_BUFFER_BIT);
   }
 
+  /**
+   * Return the underlying WebGLRenderingContext.
+   * Used by Playback to call gl.finish() before createImageBitmap() so that
+   * all pending GPU commands complete before pixel capture.
+   * @returns {WebGLRenderingContext}
+   */
+  getGLContext() { return this.gl; }
+
   destroy() {
     const gl = this.gl;
     gl.deleteTexture(this.textureY);

@@ -327,6 +327,11 @@ export class Playback {
           const frameDuration = frameDurationUs(this._fps);
           const frameIndex = Math.round(this._playheadPts / frameDuration);
           const w = this._seqW, h = this._seqH;
+          // finish() blocks until all pending GPU commands complete, ensuring
+          // createImageBitmap captures the current frame — not the previous one.
+          // (flush() only submits commands; finish() guarantees completion.)
+          const gl = this._player.getGLContext?.();
+          if (gl) gl.finish();
           createImageBitmap(this._player.canvas).then((bm) => {
             this._compositionCache.set(this._seqId, editGen, frameIndex, { bitmap: bm, width: w, height: h });
           }).catch(() => {}); // Non-fatal if capture fails
@@ -535,6 +540,10 @@ export class Playback {
         const frameDuration = frameDurationUs(this._fps);
         const frameIndex = Math.round(pts / frameDuration);
         const w = this._seqW, h = this._seqH;
+        // finish() blocks until all pending GPU commands complete, ensuring
+        // createImageBitmap captures the current frame — not the previous one.
+        const gl = this._player.getGLContext?.();
+        if (gl) gl.finish();
         createImageBitmap(this._player.canvas).then((bm) => {
           this._compositionCache.set(this._seqId, editGen, frameIndex, { bitmap: bm, width: w, height: h });
         }).catch(() => {}); // Non-fatal if capture fails
