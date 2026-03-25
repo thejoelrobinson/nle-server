@@ -368,6 +368,16 @@ export class Playback {
     this._playheadPts += elapsed * 1000;   // ms → µs
     if (this._duration > 0) this._playheadPts = Math.min(this._playheadPts, this._duration);
 
+    // End-of-clip: stop playback and hold the last frame.
+    if (this._duration > 0 && this._playheadPts >= this._duration) {
+      this._playheadPts = this._duration;
+      this.pause();
+      if (this._lastDisplayedBitmap && this._player) {
+        this._player.drawFrameFull(this._lastDisplayedBitmap);
+      }
+      return;
+    }
+
     // ── L1 Composition Cache check ─────────────────────────────────────────
     if (this._engine && this._seqId && this._player) {
       const editGen      = this._engine.get_edit_generation?.(this._seqId) ?? 0;
@@ -505,9 +515,12 @@ export class Playback {
         if ((this._nextDecodePts - this._playheadPts) < prefetchAheadUs) {
           const targetPts = this._nextDecodePts;
 
-          // Don't decode past end of sequence.
-          if (this._duration > 0 && targetPts > this._duration) {
-            await new Promise((r) => setTimeout(r, 100));
+          // Don't decode past end of sequence (3-frame buffer ensures the last frame is cached).
+          const decodeEndPts = this._duration > 0
+            ? this._duration + this._frameDurationUs * 3
+            : Infinity;
+          if (targetPts > decodeEndPts) {
+            await new Promise((r) => setTimeout(r, 50));
             if (!this._isPlaying || this._loopGeneration !== generation) break;
             continue;
           }
