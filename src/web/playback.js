@@ -37,8 +37,8 @@ function mapFFmpegColorspace(avcol_spc) {
   return COLORSPACE_DEFAULT;
 }
 
-const MAX_CACHE_FRAMES  = 30;     // per-source LRU cap
-const PREFETCH_AHEAD_MS = 3000;  // how far ahead _decodeLoop stays (ms)
+const MAX_CACHE_FRAMES  = 90;     // ~3.75s at 24fps — matches prefetch window
+const PREFETCH_AHEAD_MS = 2000;  // 2s lookahead — fits within 90-frame cache
 const PRE_ROLL_FRAMES   = 8;      // frames decoded before rAF starts
 
 export class Playback {
@@ -279,10 +279,11 @@ export class Playback {
       }
     }
     if (worstKey === null) {
-      // All frames are ahead — evict the oldest by insertion time.
-      let oldestTime = Infinity;
-      for (const [key, entry] of map.entries()) {
-        if (entry.addedAt < oldestTime) { oldestTime = entry.addedAt; worstKey = key; }
+      // All frames are ahead of playhead — evict the furthest future frame
+      // to keep the frames the playhead is approaching.
+      let furthestKey = -Infinity;
+      for (const [key] of map.entries()) {
+        if (key > furthestKey) { furthestKey = key; worstKey = key; }
       }
     }
     if (worstKey !== null) {
@@ -533,6 +534,17 @@ export class Playback {
               frameData = null;
             }
 
+            if (!frameData) {
+              // fallback: try random-access seek for this pts
+              try {
+                frameData = await this._pool.decodeFrameAt(
+                  resolved.source_path,
+                  usToSecs(resolved.source_pts)
+                );
+              } catch (e) {
+                frameData = null;
+              }
+            }
             if (!frameData) continue;
 
             try {
