@@ -39,7 +39,7 @@ function mapFFmpegColorspace(avcol_spc) {
 
 const MAX_CACHE_FRAMES  = 90;     // ~3.75s at 24fps — matches prefetch window
 const PREFETCH_AHEAD_MS = 2000;  // 2s lookahead — fits within 90-frame cache
-const PRE_ROLL_FRAMES   = 8;      // frames decoded before rAF starts
+const PRE_ROLL_FRAMES   = 48;     // fill the full 2000ms prefetch window (was 8)
 
 export class Playback {
   /**
@@ -96,6 +96,7 @@ export class Playback {
     // Decode loop state
     this._nextDecodePts   = 0;               // µs — next position to decode
     this._prefetchAheadMs = PREFETCH_AHEAD_MS;
+    this._loopGeneration  = 0;               // incremented on each play() to invalidate stale loops
 
     this._onStateChange = onPlayStateChange;
     this._onTimecode    = onTimecodeUpdate;
@@ -159,6 +160,7 @@ export class Playback {
 
     // Flush stale frames and fill the cache before the rAF loop starts.
     this._flushCache();
+    this._nextDecodePts = this._playheadPts;  // reset before pre-roll (stale loop may have advanced it)
     await this._preRoll(this._playheadPts, PRE_ROLL_FRAMES);
 
     // Guard: user may have paused during pre-roll.
@@ -166,8 +168,9 @@ export class Playback {
 
     this._lastFrameMs = null;
     this._tickCount   = 0;
+    this._loopGeneration++;                              // invalidate any running loop
     this._rafId = requestAnimationFrame((now) => this._tick(now));
-    this._decodeLoop();  // fire-and-forget async prefetch loop
+    this._decodeLoop(this._loopGeneration);  // fire-and-forget async prefetch loop
   }
 
   pause() {
@@ -494,8 +497,8 @@ export class Playback {
    * Yields via setTimeout(0) between frames so the main thread stays free.
    * Terminates when _isPlaying becomes false.
    */
-  async _decodeLoop() {
-    while (this._isPlaying) {
+  async _decodeLoop(generation) {
+    while (this._isPlaying && this._loopGeneration === generation) {
       try {
         const prefetchAheadUs = this._prefetchAheadMs * 1000;
 
@@ -505,13 +508,14 @@ export class Playback {
           // Don't decode past end of sequence.
           if (this._duration > 0 && targetPts > this._duration) {
             await new Promise((r) => setTimeout(r, 100));
+            if (!this._isPlaying || this._loopGeneration !== generation) break;
             continue;
           }
 
           const allResolved = this._engine?.resolve_all_frames(this._seqId, targetPts) ?? [];
 
           for (const resolved of allResolved) {
-            if (!this._isPlaying) break;
+            if (!this._isPlaying || this._loopGeneration !== generation) break;
 
             const sourcePts = Math.round(resolved.source_pts);
             // Use exact-match check so we never treat an adjacent cached frame as
@@ -534,6 +538,9 @@ export class Playback {
               frameData = null;
             }
 
+            // Check generation after each await point.
+            if (!this._isPlaying || this._loopGeneration !== generation) break;
+
             if (!frameData) {
               // fallback: try random-access seek for this pts
               try {
@@ -544,11 +551,13 @@ export class Playback {
               } catch (e) {
                 frameData = null;
               }
+              if (!this._isPlaying || this._loopGeneration !== generation) break;
             }
             if (!frameData) continue;
 
             try {
               const cached = await _toImageBitmapIfNeeded(frameData);
+              if (!this._isPlaying || this._loopGeneration !== generation) break;
               if (cached) this._setCacheEntry(resolved.source_path, sourcePts, cached);
             } catch (e) {
               console.warn('[Playback] _decodeLoop bitmap error (skipping frame):', e); // eslint-disable-line no-console
@@ -564,6 +573,7 @@ export class Playback {
 
       // Yield to the event loop so rAF callbacks and microtasks are not starved.
       await new Promise((r) => setTimeout(r, 0));
+      if (!this._isPlaying || this._loopGeneration !== generation) break;
     }
   }
 
