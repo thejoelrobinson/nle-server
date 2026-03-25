@@ -347,6 +347,8 @@ export class Playback {
       }
 
       firstFrame = false;
+      // Yield so rAF callbacks and UI events aren't starved during pre-roll.
+      await new Promise((r) => setTimeout(r, 0));
     }
 
     // Position decode loop to continue from where pre-roll left off.
@@ -398,10 +400,7 @@ export class Playback {
         const topClip = this._engine.resolve_frame(this._seqId, this._playheadPts);
         setTimeout(() => this._decodeAndPushAudio(this._playheadPts, topClip), 0);
         if (this._duration > 0 && this._playheadPts >= this._duration) {
-          this._isPlaying   = false;
-          this._rafId       = null;
-          this._lastFrameMs = null;
-          this._onStateChange?.(false);
+          this.pause();
           return;
         }
         this._rafId = requestAnimationFrame((now2) => this._tick(now2));
@@ -488,10 +487,7 @@ export class Playback {
 
     // Stop at end of sequence.
     if (this._duration > 0 && this._playheadPts >= this._duration) {
-      this._isPlaying   = false;
-      this._rafId       = null;
-      this._lastFrameMs = null;
-      this._onStateChange?.(false);
+      this.pause();
       return;
     }
 
@@ -566,7 +562,24 @@ export class Playback {
               }
               if (!this._isPlaying || this._loopGeneration !== generation) break;
             }
-            if (!frameData) continue;
+            if (!frameData) {
+              // Both proxy paths returned null — proxy EOF before actual source end.
+              // Try direct source decode as last resort (useProxy = false).
+              try {
+                frameData = await this._pool.decodeFrameAt(
+                  resolved.source_path,
+                  usToSecs(resolved.source_pts),
+                  false  // bypass proxy, hit SOURCE bridge directly
+                );
+              } catch (e) {
+                frameData = null;
+              }
+              if (!this._isPlaying || this._loopGeneration !== generation) break;
+            }
+            if (!frameData) {
+              console.warn('[DecodeLoop] All decode paths null for pts', resolved.source_pts, '— skipping'); // eslint-disable-line no-console
+              continue;
+            }
 
             try {
               const cached = await _toImageBitmapIfNeeded(frameData);
