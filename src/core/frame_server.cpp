@@ -640,7 +640,7 @@ emscripten::val FrameServer::generate_proxy(int target_width, int target_height)
 
     // ── 4. Set up output AVFormatContext writing to a dynamic buffer ──────
     AVFormatContext* out_ctx = nullptr;
-    if (avformat_alloc_output_context2(&out_ctx, nullptr, "mjpeg", nullptr) < 0 || !out_ctx) {
+    if (avformat_alloc_output_context2(&out_ctx, nullptr, "avi", nullptr) < 0 || !out_ctx) {
         fprintf(stderr, "FrameServer::generate_proxy: avformat_alloc_output_context2 failed\n");
         avcodec_free_context(&enc_ctx);
         return emscripten::val::null();
