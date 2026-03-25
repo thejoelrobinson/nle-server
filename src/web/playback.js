@@ -1,69 +1,45 @@
-import { FrameCache } from './frame_cache.js';
 import { CompositionCache } from './composition_cache.js';
-import { DiskFrameCache } from './disk_cache.js';
 import { frameDurationUs, usToSecs } from './timecode.js';
 
 /**
- * playback.js – Timeline playback engine.
+ * playback.js – Timeline playback engine (professional NLE architecture).
  *
- * Drives the Program Monitor playhead using wall-clock timing via
- * requestAnimationFrame. Decoupled from transport UI — callers receive
- * state changes via callbacks.
- *
- * Design:
- *  - Wall-clock elapsed time (rAF timestamp) drives playhead advancement.
- *  - Delta is clamped to 2× frame duration so a backgrounded tab can't
- *    jump the playhead by seconds when it resumes.
- *  - _tick() ONLY reads from the frame cache and draws — it never calls the
- *    WASM decoder synchronously, which was causing [Violation] rAF handler
- *    took <N>ms on 4K frames.
- *  - _decodeLoop() runs as a fire-and-forget async loop alongside the rAF,
- *    prefetching frames into the cache between rAF ticks using setTimeout(4)
- *    yields so the main thread stays responsive.
- *  - Timeline canvas is repainted every other rAF tick (~30 fps) rather than
- *    every tick (~60 fps), halving canvas 2D overdraw cost.
- *  - Timeline is updated directly (_timeline._playhead + render()) during the
- *    rAF tick to avoid dispatching 'playhead-change', which would trigger the
- *    scrub listener and kill playback.
+ * Architecture:
+ *  - _decodeLoop() is the ONLY path that calls decode. It runs as an
+ *    independent async loop, staying _prefetchAheadMs ahead of the playhead.
+ *    It NEVER synchronises with _tick().
+ *  - _tick() (rAF) ONLY reads from the frame cache. On a cache miss it holds
+ *    the last displayed frame — no black canvas, no clear(), no decode.
+ *  - play() awaits a pre-roll of PRE_ROLL_FRAMES before starting the rAF
+ *    loop so the cache is warm on the very first tick.
+ *  - Frame cache lookup uses nearest-frame selection: find the cached entry
+ *    whose key is closest to the target pts (within ±1 frame duration).
+ *  - decodeLoop uses decodeNextFrame (sequential) for the prefetch path;
+ *    decodeFrameAt (random access) is only used for pre-roll / seek.
+ *  - LRU eviction: max 30 frames per source; evict furthest behind playhead.
  */
 
 import { AudioEngine } from './audio_engine.js';
 
 // FFmpeg AVCOL_SPC_* values
-const AVCOL_SPC_BT709 = 1;
+const AVCOL_SPC_BT709    = 1;
 const AVCOL_SPC_BT2020_NCL = 9;
 
 // Player colorspace indices: 0=BT.601, 1=BT.709, 2=BT.2020
-const COLORSPACE_BT601 = 0;
-const COLORSPACE_BT709 = 1;
-const COLORSPACE_BT2020 = 2;
+const COLORSPACE_BT601   = 0;
+const COLORSPACE_BT709   = 1;
+const COLORSPACE_BT2020  = 2;
 const COLORSPACE_DEFAULT = COLORSPACE_BT601;
 
-/**
- * Map FFmpeg AVCOL_SPC_* value to player colorspace index.
- * @param {number} avcol_spc
- * @returns {number}
- */
 function mapFFmpegColorspace(avcol_spc) {
-  if (avcol_spc === AVCOL_SPC_BT709) return COLORSPACE_BT709;
+  if (avcol_spc === AVCOL_SPC_BT709)    return COLORSPACE_BT709;
   if (avcol_spc === AVCOL_SPC_BT2020_NCL) return COLORSPACE_BT2020;
   return COLORSPACE_DEFAULT;
 }
 
-/**
- * Compute how many decoded frames to hold in the cache, bounded by a 256 MB
- * memory budget.  For 4K (3840×2160 YUV420p ≈ 12 MB/frame) this yields ~21
- * frames; for 1080p (~3 MB/frame) the cap of 30 applies.
- *
- * @param {number} width
- * @param {number} height
- * @returns {number} cache capacity in frames
- */
-function computeCacheSize(width, height) {
-  const frameMB  = (width * height * 1.5) / (1024 * 1024); // YUV420p bytes → MB
-  const budgetMB = 256;
-  return Math.max(4, Math.min(30, Math.floor(budgetMB / frameMB)));
-}
+const MAX_CACHE_FRAMES  = 30;     // per-source LRU cap
+const PREFETCH_AHEAD_MS = 3000;  // how far ahead _decodeLoop stays (ms)
+const PRE_ROLL_FRAMES   = 8;      // frames decoded before rAF starts
 
 export class Playback {
   /**
@@ -73,8 +49,8 @@ export class Playback {
    * @param {string}   opts.sequenceId          — current sequence ID
    * @param {number}   [opts.fps=24]            — frames per second
    * @param {number}   [opts.duration=0]        — sequence duration in µs
-   * @param {number}   [opts.width=1920]        — sequence width (for cache sizing)
-   * @param {number}   [opts.height=1080]       — sequence height (for cache sizing)
+   * @param {number}   [opts.width=1920]        — sequence width
+   * @param {number}   [opts.height=1080]       — sequence height
    * @param {function} [opts.onPlayStateChange] — called with (isPlaying: bool)
    * @param {function} [opts.onTimecodeUpdate]  — called with (pts: µs) each tick
    * @param {function} [opts.onFrameState]      — called with (hasFrame: bool)
@@ -87,30 +63,39 @@ export class Playback {
     onTimecodeUpdate  = null,
     onFrameState      = null,
   }) {
-    this._timeline    = timeline;
-    this._engine      = engine;
-    this._pool        = pool;
-    this._player      = null;       // set via setProgramPlayer() when GL is ready
-    this._seqId       = sequenceId;
+    this._timeline = timeline;
+    this._engine   = engine;
+    this._pool     = pool;
+    this._player   = null;       // set via setProgramPlayer() when GL is ready
+    this._seqId    = sequenceId;
 
-    this._fps         = fps > 0 ? fps : 24;
-    this._frameDurMs  = 1000 / this._fps;  // ms per frame
-    this._duration    = duration;           // µs
+    this._fps        = fps > 0 ? fps : 24;
+    this._frameDurMs = 1000 / this._fps;
+    this._duration   = duration;   // µs
 
-    // Sequence dimensions for true-size rendering
-    this._seqW        = width;
-    this._seqH        = height;
+    this._seqW = width;
+    this._seqH = height;
 
-    this._cache = new FrameCache(computeCacheSize(width, height));
+    // L1: composited frame cache (sequence + edit_gen + frame_index → bitmap)
     this._compositionCache = new CompositionCache(5);
-    this._diskCache = new DiskFrameCache();
-    this._diskCache._openDB().catch(() => {}); // warm up IDB connection on startup
+
+    // L2: per-source frame cache.
+    // Map<sourcePath, Map<roundedPts, {bitmap, pts, addedAt}>>
+    // Keyed by Math.round(source_pts µs). Lookup uses nearest-frame selection.
+    this._frameCache = new Map();
+
+    // Last successfully drawn frame — held on cache miss to suppress black flash.
+    this._lastDisplayedBitmap = null;
 
     this._isPlaying   = false;
     this._rafId       = null;
     this._lastFrameMs = null;
-    this._playheadPts = 0;          // µs
-    this._tickCount   = 0;          // for timeline render throttle
+    this._playheadPts = 0;   // µs
+    this._tickCount   = 0;   // for timeline render throttle
+
+    // Decode loop state
+    this._nextDecodePts   = 0;               // µs — next position to decode
+    this._prefetchAheadMs = PREFETCH_AHEAD_MS;
 
     this._onStateChange = onPlayStateChange;
     this._onTimecode    = onTimecodeUpdate;
@@ -120,21 +105,15 @@ export class Playback {
     this._audio            = new AudioEngine();
     this._audioInitialized = false;
     this._lastAudioPts     = -1;
-
-    // Cache colorspace lookup: only re-query when source file changes
-    this._lastResolvedSourcePath = null;
-    this._lastColorspace         = 0;
-
-    this._decoding = false;
   }
 
   // ── Getters ───────────────────────────────────────────────────────────────
 
-  get isPlaying()       { return this._isPlaying; }
-  get playheadPts()     { return this._playheadPts; }
+  get isPlaying()        { return this._isPlaying; }
+  get playheadPts()      { return this._playheadPts; }
   get _frameDurationUs() { return Math.round((1 / this._fps) * 1e6); }
 
-  // ── Configuration (call when sequence settings change) ────────────────────
+  // ── Configuration ─────────────────────────────────────────────────────────
 
   setFps(fps) {
     this._fps        = fps > 0 ? fps : 24;
@@ -143,22 +122,33 @@ export class Playback {
 
   setDuration(durMicros) { this._duration = durMicros; }
   setSequenceId(id)      { this._seqId    = id; }
-  setSequenceSize(w, h)  { this._seqW = w; this._seqH = h; this._player?.setSequenceMode(w, h); }
-  setProgramPlayer(p)    {
-    this._player   = p;
+
+  setSequenceSize(w, h) {
+    this._seqW = w;
+    this._seqH = h;
+    this._player?.setSequenceMode(w, h);
+  }
+
+  setProgramPlayer(p) {
+    this._player = p;
     if (p) p.setSequenceMode(this._seqW, this._seqH);
   }
 
   // ── Transport ─────────────────────────────────────────────────────────────
 
-  play() {
+  /**
+   * Start playback. Awaits a pre-roll before the rAF loop begins so the
+   * cache is warm on the very first tick. Returns a Promise.
+   */
+  async play() {
     if (this._isPlaying) return;
     if (!this._player) {
       console.warn('[Playback] play() called but _player is null — frames will not draw until setProgramPlayer() is called'); // eslint-disable-line no-console
     }
-    this._isPlaying   = true;
-    this._lastFrameMs = null;
-    this._tickCount   = 0;
+
+    this._isPlaying = true;
+    this._onStateChange?.(true);
+
     // Audio init must happen inside a user-gesture handler; play() is one.
     if (!this._audioInitialized) {
       this._audio.init().then(() => { this._audio.start(); });
@@ -166,16 +156,24 @@ export class Playback {
     } else {
       this._audio.start();
     }
+
+    // Flush stale frames and fill the cache before the rAF loop starts.
+    this._flushCache();
+    await this._preRoll(this._playheadPts, PRE_ROLL_FRAMES);
+
+    // Guard: user may have paused during pre-roll.
+    if (!this._isPlaying) return;
+
+    this._lastFrameMs = null;
+    this._tickCount   = 0;
     this._rafId = requestAnimationFrame((now) => this._tick(now));
-    this._decodeLoop(); // fire-and-forget async prefetch loop
-    this._onStateChange?.(true);
+    this._decodeLoop();  // fire-and-forget async prefetch loop
   }
 
   pause() {
     if (!this._isPlaying) return;
-    this._isPlaying   = false;   // also stops _decodeLoop
+    this._isPlaying   = false;
     this._lastFrameMs = null;
-    this._decoding    = false;
     if (this._rafId !== null) { cancelAnimationFrame(this._rafId); this._rafId = null; }
     this._audio.stop();
     this._onStateChange?.(false);
@@ -202,84 +200,181 @@ export class Playback {
    * Sync playhead from an external source (user scrub, project load, etc.).
    * Updates internal state and decodes the frame at pts immediately.
    * Does NOT fire the timeline's 'playhead-change' event, preventing loops.
-   *
    * @param {number} pts — target position in µs
    */
   syncPlayheadPts(pts) {
-    this._playheadPts            = pts;
-    this._decoding               = false;
-    this._lastResolvedSourcePath = null;  // invalidate colorspace cache on seek
+    this._playheadPts   = pts;
+    this._nextDecodePts = pts;
     this._updateTimelineDisplay(pts);
     this._onTimecode?.(pts);
-    // _decodeAndDisplay is async; fire-and-forget is fine — the frame draws
-    // when ready and the UI stays responsive throughout.
+    // Fire-and-forget: old frame stays visible until new one is ready.
     this._decodeAndDisplay(pts);
   }
 
-  // ── Internal helpers ─────────────────────────────────────────────────────
-
   /**
-   * Compute transform (scale + offset) for a clip based on its native dimensions.
-   * @param {string} sourcePath
-   * @param {object} resolved — result from resolve_all_frames with posX, posY, userScale
-   * @returns {object} { scaleX, scaleY, offsetX, offsetY }
+   * Release all resources. Call when the Playback instance is no longer needed.
    */
-  _computeTransform(sourcePath, resolved) {
-    const info   = this._pool.getInfo(sourcePath);
-    const clipW  = info?.width  ?? this._seqW;
-    const clipH  = info?.height ?? this._seqH;
-    const scaleX = (clipW / this._seqW) * (resolved.userScale ?? 1.0);
-    const scaleY = (clipH / this._seqH) * (resolved.userScale ?? 1.0);
-    // Position in NDC (posX/posY are pixels from sequence center; NDC Y is inverted)
-    const offsetX =  (resolved.posX ?? 0) / (this._seqW / 2);
-    const offsetY = -(resolved.posY ?? 0) / (this._seqH / 2);
-    return { scaleX, scaleY, offsetX, offsetY };
+  dispose() {
+    this.pause();
+    this._flushCache();
+    this._lastDisplayedBitmap = null;
+  }
+
+  // ── Frame cache ───────────────────────────────────────────────────────────
+
+  /** Close all cached bitmaps and clear all source maps. */
+  _flushCache() {
+    for (const map of this._frameCache.values()) {
+      for (const entry of map.values()) {
+        entry?.bitmap?.close?.();
+      }
+    }
+    this._frameCache.clear();
+    this._lastDisplayedBitmap = null;
+  }
+
+  _getCacheMap(sourcePath) {
+    if (!this._frameCache.has(sourcePath)) {
+      this._frameCache.set(sourcePath, new Map());
+    }
+    return this._frameCache.get(sourcePath);
+  }
+
+  _setCacheEntry(sourcePath, roundedPts, frameData) {
+    const map = this._getCacheMap(sourcePath);
+    map.set(roundedPts, { ...frameData, pts: roundedPts, addedAt: Date.now() });
+    this._evictOldFrames(sourcePath, map);
   }
 
   /**
-   * Update timeline display without firing 'playhead-change' event.
-   * Directly mutates timeline internal state to avoid triggering scrub listener.
-   * @param {number} pts — playhead position in µs
+   * Find the nearest cached frame to targetPts, within ±1 frame duration.
+   * @param {string} sourcePath
+   * @param {number} targetPts — µs
+   * @returns {object|null}
    */
-  _updateTimelineDisplay(pts) {
-    if (this._timeline) {
-      this._timeline._playhead = pts;
-      this._timeline.render();
+  _findNearestFrame(sourcePath, targetPts) {
+    const map = this._frameCache.get(sourcePath);
+    if (!map || map.size === 0) return null;
+    const tolerance = this._frameDurationUs;
+    let bestEntry = null, bestDist = Infinity;
+    for (const [key, entry] of map.entries()) {
+      const dist = Math.abs(key - targetPts);
+      if (dist < bestDist) { bestDist = dist; bestEntry = entry; }
+    }
+    return bestDist <= tolerance ? bestEntry : null;
+  }
+
+  /**
+   * LRU eviction: keep at most MAX_CACHE_FRAMES per source.
+   * Evicts the frame furthest behind the playhead; if all are ahead, evicts oldest.
+   */
+  _evictOldFrames(sourcePath, map) {
+    if (map.size <= MAX_CACHE_FRAMES) return;
+    // Prefer evicting frames behind the playhead (they won't be needed again).
+    let worstKey = null, worstDist = -1;
+    for (const key of map.keys()) {
+      if (key < this._playheadPts) {
+        const dist = this._playheadPts - key;
+        if (dist > worstDist) { worstDist = dist; worstKey = key; }
+      }
+    }
+    if (worstKey === null) {
+      // All frames are ahead — evict the oldest by insertion time.
+      let oldestTime = Infinity;
+      for (const [key, entry] of map.entries()) {
+        if (entry.addedAt < oldestTime) { oldestTime = entry.addedAt; worstKey = key; }
+      }
+    }
+    if (worstKey !== null) {
+      map.get(worstKey)?.bitmap?.close?.();
+      map.delete(worstKey);
     }
   }
 
-  // ── rAF tick — ONLY cache lookup + draw, NO decode ───────────────────────
+  // ── Pre-roll ──────────────────────────────────────────────────────────────
+
+  /**
+   * Decode frameCount frames starting at startPts and fill the frame cache.
+   * Uses decodeFrameAt for the first frame (positions the decoder) and
+   * decodeNextFrame for subsequent frames (sequential, no seek overhead).
+   * Does NOT start _tick — caller must do that after this resolves.
+   * @param {number} startPts   — µs
+   * @param {number} frameCount
+   */
+  async _preRoll(startPts, frameCount = PRE_ROLL_FRAMES) {
+    if (!this._pool || !this._engine || !this._seqId) return;
+    const frameDur = this._frameDurationUs;
+    let firstFrame = true;
+
+    for (let i = 0; i < frameCount; i++) {
+      if (!this._isPlaying) break;   // aborted by pause()
+
+      const targetPts = startPts + i * frameDur;
+      if (this._duration > 0 && targetPts > this._duration) break;
+
+      const allResolved = this._engine.resolve_all_frames(this._seqId, targetPts) ?? [];
+      for (const resolved of allResolved) {
+        if (!this._isPlaying) break;
+        const sourcePts = Math.round(resolved.source_pts);
+        if (this._findNearestFrame(resolved.source_path, sourcePts)) continue;
+
+        let frameData;
+        try {
+          if (firstFrame) {
+            // Random access: seeks the decoder to the right position.
+            frameData = await this._pool.decodeFrameAt(
+              resolved.source_path,
+              usToSecs(resolved.source_pts)
+            );
+          } else {
+            // Sequential: no seek overhead; falls back internally if needed.
+            frameData = await this._pool.decodeNextFrame(
+              resolved.source_path,
+              usToSecs(resolved.source_pts)
+            );
+          }
+        } catch (e) {
+          console.warn('[Playback] _preRoll decode error (skipping):', e); // eslint-disable-line no-console
+          continue;
+        }
+
+        const cached = await _toImageBitmapIfNeeded(frameData);
+        if (cached) this._setCacheEntry(resolved.source_path, sourcePts, cached);
+      }
+
+      firstFrame = false;
+    }
+
+    // Position decode loop to continue from where pre-roll left off.
+    this._nextDecodePts = startPts + frameCount * frameDur;
+  }
+
+  // ── rAF tick — cache read + draw only, NEVER decode ──────────────────────
 
   _tick(now) {
     if (!this._isPlaying) return;
 
-    // Elapsed since last tick. Cap at 2× frame duration so a backgrounded
-    // tab can't jump the playhead by seconds when it comes back.
+    // Elapsed since last tick, clamped to 2× frame duration so a backgrounded
+    // tab can't jump the playhead by seconds when it resumes.
     const elapsed = this._lastFrameMs !== null
       ? Math.min(now - this._lastFrameMs, this._frameDurMs * 2)
       : 0;
     this._lastFrameMs = now;
 
-    // Advance playhead (ms → µs conversion)
-    this._playheadPts += elapsed * 1000;
+    this._playheadPts += elapsed * 1000;   // ms → µs
     if (this._duration > 0) this._playheadPts = Math.min(this._playheadPts, this._duration);
 
-    // Resolve all clips under the playhead (bottom-to-top compositing order)
-    const allResolved = this._engine && this._seqId
-      ? this._engine.resolve_all_frames(this._seqId, this._playheadPts)
-      : [];
-
-    // ── L1 Composition Cache check ────────────────────────────────────────
+    // ── L1 Composition Cache check ─────────────────────────────────────────
     if (this._engine && this._seqId && this._player) {
-      const editGen = this._engine.get_edit_generation?.(this._seqId) ?? 0;
-      const frameDuration = frameDurationUs(this._fps);
-      const frameIndex = Math.round(this._playheadPts / frameDuration);
-      const l1Hit = this._compositionCache.get(this._seqId, editGen, frameIndex);
+      const editGen      = this._engine.get_edit_generation?.(this._seqId) ?? 0;
+      const frameDur     = frameDurationUs(this._fps);
+      const frameIndex   = Math.round(this._playheadPts / frameDur);
+      const l1Hit        = this._compositionCache.get(this._seqId, editGen, frameIndex);
       if (l1Hit) {
         this._player.drawFrameFull(l1Hit);
+        this._lastDisplayedBitmap = l1Hit;
         this._onFrameState?.(true);
         this._onTimecode?.(this._playheadPts);
-        // Still update timeline and audio on L1 hit
         this._tickCount++;
         if (this._tickCount % 2 === 0) {
           this._updateTimelineDisplay(this._playheadPts);
@@ -296,78 +391,88 @@ export class Playback {
           return;
         }
         this._rafId = requestAnimationFrame((now2) => this._tick(now2));
-        return; // Skip L2 cache path
+        return;
       }
     }
 
-    // ── Draw (cache-first; trigger async decode on miss) ──────────────────
+    // ── L2 Frame Cache lookup — nearest-frame selection ────────────────────
+    const allResolved = this._engine && this._seqId
+      ? this._engine.resolve_all_frames(this._seqId, this._playheadPts)
+      : [];
+
     if (allResolved.length === 0) {
-      // No clips under playhead — clear canvas to black
-      if (this._player) this._player.clear();
+      // No clips under playhead.
+      if (this._lastDisplayedBitmap && this._player) {
+        this._player.drawFrameFull(this._lastDisplayedBitmap);
+      } else if (this._player) {
+        this._player.clear();
+      }
       this._onFrameState?.(false);
     } else if (this._player) {
-      // Check if all clips are in cache
       const allCached = allResolved.every((resolved) => {
         const sourcePts = Math.round(resolved.source_pts);
-        return this._cache.get(resolved.source_path, sourcePts) !== null;
+        return this._findNearestFrame(resolved.source_path, sourcePts) !== null;
       });
 
       if (allCached) {
-        // All clips cached — composite them
+        // All clips in cache — composite and draw.
         this._player.clear();
-        allResolved.forEach((resolved) => {
-          const sourcePts = Math.round(resolved.source_pts);
-          const frame = this._cache.get(resolved.source_path, sourcePts);
+        for (const resolved of allResolved) {
+          const sourcePts  = Math.round(resolved.source_pts);
+          const frame      = this._findNearestFrame(resolved.source_path, sourcePts);
           if (frame) {
-            const transform = this._computeTransform(resolved.source_path, resolved);
-            this._player.drawFrameAt({ ...frame, colorspace: mapFFmpegColorspace(this._pool.getInfo(resolved.source_path)?.colorspace ?? AVCOL_SPC_BT709) }, { ...transform, opacity: resolved.opacity ?? 1.0 });
+            const transform  = this._computeTransform(resolved.source_path, resolved);
+            const colorspace = mapFFmpegColorspace(
+              this._pool.getInfo(resolved.source_path)?.colorspace ?? AVCOL_SPC_BT709
+            );
+            this._player.drawFrameAt(
+              { ...frame, colorspace },
+              { ...transform, opacity: resolved.opacity ?? 1.0 }
+            );
           }
-        });
+        }
         this._onFrameState?.(true);
 
-        // ── Capture composited canvas for L1 cache (async, non-blocking) ────
+        // Capture composited canvas → L1 cache (async, non-blocking).
         if (this._engine && this._seqId) {
-          const editGen = this._engine.get_edit_generation?.(this._seqId) ?? 0;
-          const frameDuration = frameDurationUs(this._fps);
-          const frameIndex = Math.round(this._playheadPts / frameDuration);
+          const editGen    = this._engine.get_edit_generation?.(this._seqId) ?? 0;
+          const frameDur   = frameDurationUs(this._fps);
+          const frameIndex = Math.round(this._playheadPts / frameDur);
           const w = this._seqW, h = this._seqH;
-          // finish() blocks until all pending GPU commands complete, ensuring
-          // createImageBitmap captures the current frame — not the previous one.
-          // (flush() only submits commands; finish() guarantees completion.)
           const gl = this._player.getGLContext?.();
           if (gl) gl.finish();
           createImageBitmap(this._player.canvas).then((bm) => {
-            this._compositionCache.set(this._seqId, editGen, frameIndex, { bitmap: bm, width: w, height: h });
-          }).catch(() => {}); // Non-fatal if capture fails
+            const entry = { bitmap: bm, width: w, height: h };
+            this._compositionCache.set(this._seqId, editGen, frameIndex, entry);
+            this._lastDisplayedBitmap = entry;
+          }).catch(() => {});
         }
       } else {
-        // Cache miss — trigger an async decode if one isn't already in flight.
-        // The _decoding flag prevents concurrent decode calls piling up.
-        if (!this._decoding) {
-          this._decoding = true;
-          this._decodeAndDisplay(pts, allResolved).finally(() => { this._decoding = false; });
+        // Cache miss — hold the last drawn frame. _decodeLoop will fill
+        // the cache; we'll pick up the new frames on the next tick.
+        // NEVER call clear() here — that causes the black-flash bug.
+        if (this._lastDisplayedBitmap) {
+          this._player.drawFrameFull(this._lastDisplayedBitmap);
         }
       }
     }
 
-    // ── Timeline: repaint every other tick (~30 fps) ──────────────────────
+    // ── Timeline: repaint every other tick (~30 fps) ───────────────────────
     this._tickCount++;
     if (this._tickCount % 2 === 0) {
       this._updateTimelineDisplay(this._playheadPts);
     } else {
-      // Still advance the internal playhead so the next full repaint is right.
       if (this._timeline) this._timeline._playhead = this._playheadPts;
     }
     this._onTimecode?.(this._playheadPts);
 
-    // ── Audio (throttled inside _decodeAndPushAudio) ──────────────────────
-    // Use the top-priority clip for audio (first entry when resolve_frame is called)
+    // ── Audio ──────────────────────────────────────────────────────────────
     const topClip = this._engine && this._seqId
       ? this._engine.resolve_frame(this._seqId, this._playheadPts)
       : null;
     setTimeout(() => this._decodeAndPushAudio(this._playheadPts, topClip), 0);
 
-    // Stop at end of sequence
+    // Stop at end of sequence.
     if (this._duration > 0 && this._playheadPts >= this._duration) {
       this._isPlaying   = false;
       this._rafId       = null;
@@ -379,86 +484,70 @@ export class Playback {
     this._rafId = requestAnimationFrame((now2) => this._tick(now2));
   }
 
-  // ── Async decode loop — runs between rAF ticks ───────────────────────────
+  // ── Async decode loop — independent of rAF ───────────────────────────────
 
   /**
-   * Continuously prefetch frames ahead of the playhead into the cache.
-   * Runs as a fire-and-forget async loop alongside the rAF loop.  Yields
-   * every 4 ms via setTimeout so the main thread stays unblocked between
-   * rAF callbacks.
-   *
-   * When the hardware WebCodecs path is active, decodeFrameAt() returns
-   * { videoFrame, width, height }.  We convert VideoFrame → ImageBitmap here
-   * so the rAF tick can draw it synchronously from cache without holding an
-   * open VideoFrame reference.
-   *
-   * The loop terminates as soon as _isPlaying becomes false.
+   * Continuously prefetch frames ahead of the playhead.
+   * Runs as a fire-and-forget async loop alongside the rAF loop.
+   * Uses decodeNextFrame (sequential, no seek) for the hot path.
+   * Yields via setTimeout(0) between frames so the main thread stays free.
+   * Terminates when _isPlaying becomes false.
    */
   async _decodeLoop() {
-    const lookahead = 5;
-
     while (this._isPlaying) {
-      const pts           = this._playheadPts;
-      const frameDuration = frameDurationUs(this._fps);
+      const prefetchAheadUs = this._prefetchAheadMs * 1000;
 
-      for (let i = 0; i <= lookahead; i++) {
-        if (!this._isPlaying) break;
+      if ((this._nextDecodePts - this._playheadPts) < prefetchAheadUs) {
+        const targetPts = this._nextDecodePts;
 
-        const targetPts = pts + i * frameDuration;
-        if (this._duration > 0 && targetPts > this._duration) break;
+        // Don't decode past end of sequence.
+        if (this._duration > 0 && targetPts > this._duration) {
+          await new Promise((r) => setTimeout(r, 0));
+          continue;
+        }
 
-        // Decode all clips at this pts
         const allResolved = this._engine?.resolve_all_frames(this._seqId, targetPts) ?? [];
+
         for (const resolved of allResolved) {
+          if (!this._isPlaying) break;
+
           const sourcePts = Math.round(resolved.source_pts);
-          if (this._cache.has(resolved.source_path, sourcePts)) continue;
+          // Skip if already cached (nearest-frame check avoids re-decoding same frame).
+          if (this._findNearestFrame(resolved.source_path, sourcePts)) continue;
 
-          // ── L3 check on L2 miss ────────────────────────────────────────────
-          let cached = await this._diskCache.lookup(resolved.source_path, sourcePts);
-          if (cached) {
-            this._cache.set(resolved.source_path, sourcePts, cached);
-            continue; // L3 hit — skip WASM decode
-          }
-
-          // decodeFrameAt is async on both the WebCodecs and WASM paths.
-          // Wrap in try/catch: any decode error must NOT kill the loop — a
-          // single bad frame should be skipped, not crash the entire prefetch.
           let frameData;
           try {
-            frameData = await this._pool.decodeFrameAt(
+            // Sequential path: no seek overhead.
+            // Pool falls back to decodeFrameAt internally if the decoded
+            // frame's pts is too far from the expected position.
+            frameData = await this._pool.decodeNextFrame(
               resolved.source_path,
               usToSecs(resolved.source_pts)
             );
           } catch (e) {
             console.warn('[Playback] _decodeLoop decode error (skipping frame):', e); // eslint-disable-line no-console
-            continue;
+            frameData = null;
           }
+
           if (!frameData) continue;
 
           try {
-            cached = await _toImageBitmapIfNeeded(frameData);
+            const cached = await _toImageBitmapIfNeeded(frameData);
+            if (cached) this._setCacheEntry(resolved.source_path, sourcePts, cached);
           } catch (e) {
-            console.warn('[Playback] _decodeLoop bitmap conversion error (skipping frame):', e); // eslint-disable-line no-console
-            continue;
-          }
-          if (cached) {
-            this._cache.set(resolved.source_path, sourcePts, cached);
-            // Store in L3 async (fire-and-forget, only for bitmap frames)
-            if (cached.bitmap) {
-              this._diskCache.store(resolved.source_path, sourcePts, cached.bitmap, cached.width, cached.height)
-                .catch(() => {}); // non-fatal
-            }
+            console.warn('[Playback] _decodeLoop bitmap error (skipping frame):', e); // eslint-disable-line no-console
           }
         }
+
+        this._nextDecodePts += this._frameDurationUs;
       }
 
-      // Yield to the event loop between decode rounds so rAF callbacks
-      // and other microtasks are not starved.
-      await new Promise((r) => setTimeout(r, 4));
+      // Yield to the event loop so rAF callbacks and microtasks are not starved.
+      await new Promise((r) => setTimeout(r, 0));
     }
   }
 
-  // ── Audio decode (throttled, stays in tick for low latency) ──────────────
+  // ── Audio decode ──────────────────────────────────────────────────────────
 
   _decodeAndPushAudio(pts, resolved = null) {
     try {
@@ -469,7 +558,7 @@ export class Playback {
       }
       if (!resolved?.source_path) return;
       const targetSecs = usToSecs(pts);
-      // Skip if we already decoded audio very recently (< 80 ms lookahead gap)
+      // Skip if we already decoded audio very recently (< 80 ms lookahead gap).
       if (Math.abs(targetSecs - this._lastAudioPts) < 0.08) return;
       this._lastAudioPts = targetSecs;
       const samples = this._pool.decodeAudioAt(resolved.source_path, targetSecs, 8192);
@@ -477,88 +566,103 @@ export class Playback {
     } catch (_e) { /* non-fatal — video keeps playing */ }
   }
 
-  // ── Async decode used for scrub / step (not in rAF) ─────────────────────
+  // ── Scrub / step decode ───────────────────────────────────────────────────
 
-  async _decodeAndDisplay(pts, allResolved = null) {
-    if (!this._pool) return;
+  /**
+   * Decode and display the frame at pts (used for scrub, step, project load).
+   * Old frame stays visible until new one is ready — no clear() before awaits.
+   * @param {number} pts — µs
+   */
+  async _decodeAndDisplay(pts) {
+    if (!this._pool || !this._engine || !this._seqId) return;
     try {
-      if (!allResolved) {
-        if (!this._engine || !this._seqId) return;
-        allResolved = this._engine.resolve_all_frames(this._seqId, pts);
+      // L1 check.
+      if (this._player) {
+        const editGen    = this._engine.get_edit_generation?.(this._seqId) ?? 0;
+        const frameIndex = Math.round(pts / frameDurationUs(this._fps));
+        const l1Hit      = this._compositionCache.get(this._seqId, editGen, frameIndex);
+        if (l1Hit) {
+          this._player.drawFrameFull(l1Hit);
+          this._lastDisplayedBitmap = l1Hit;
+          this._onFrameState?.(true);
+          return;
+        }
       }
+
+      const allResolved = this._engine.resolve_all_frames(this._seqId, pts);
       if (!Array.isArray(allResolved) || allResolved.length === 0) {
         if (this._player) this._player.clear();
         this._onFrameState?.(false);
         return;
       }
 
-      // ── L1 Composition Cache check before decode ──────────────────────────
-      if (this._engine && this._seqId && this._player) {
-        const editGen = this._engine.get_edit_generation?.(this._seqId) ?? 0;
-        const frameDuration = frameDurationUs(this._fps);
-        const frameIndex = Math.round(pts / frameDuration);
-        const l1Hit = this._compositionCache.get(this._seqId, editGen, frameIndex);
-        if (l1Hit) {
-          this._player.drawFrameFull(l1Hit);
-          this._onFrameState?.(true);
-          return; // Skip decode and composite
-        }
-      }
-
-      // Decode and composite all clips. Old frame stays visible until new one
-      // is ready — no clear() before awaits to avoid black flash.
       for (const resolved of allResolved) {
         const sourcePts = Math.round(resolved.source_pts);
-        let frame = this._cache.get(resolved.source_path, sourcePts);
+        let frame = this._findNearestFrame(resolved.source_path, sourcePts);
+
         if (!frame) {
-          // ── L3 check on L2 miss ────────────────────────────────────────────
-          frame = await this._diskCache.lookup(resolved.source_path, sourcePts);
-          if (frame) {
-            this._cache.set(resolved.source_path, sourcePts, frame);
-          } else {
-            // L2 + L3 miss → WASM decode
-            const frameData = await this._pool.decodeFrameAt(
+          let frameData;
+          try {
+            frameData = await this._pool.decodeFrameAt(
               resolved.source_path,
               usToSecs(resolved.source_pts)
             );
-            frame = await _toImageBitmapIfNeeded(frameData);
-            if (frame) {
-              this._cache.set(resolved.source_path, sourcePts, frame);
-              // Store in L3 async (fire-and-forget, only for bitmap frames)
-              if (frame.bitmap) {
-                this._diskCache.store(resolved.source_path, sourcePts, frame.bitmap, frame.width, frame.height)
-                  .catch(() => {}); // non-fatal
-              }
-            }
+          } catch (e) {
+            console.warn('[Playback] _decodeAndDisplay decode error:', e); // eslint-disable-line no-console
+            continue;
           }
+          frame = await _toImageBitmapIfNeeded(frameData);
+          if (frame) this._setCacheEntry(resolved.source_path, sourcePts, frame);
         }
 
         if (frame && this._player) {
-          const info = this._pool.getInfo(resolved.source_path);
+          const info       = this._pool.getInfo(resolved.source_path);
           const colorspace = mapFFmpegColorspace(info?.colorspace ?? AVCOL_SPC_BT709);
-          const transform = this._computeTransform(resolved.source_path, resolved);
-          this._player.drawFrameAt({ ...frame, colorspace }, { ...transform, opacity: resolved.opacity ?? 1.0 });
+          const transform  = this._computeTransform(resolved.source_path, resolved);
+          this._player.drawFrameAt(
+            { ...frame, colorspace },
+            { ...transform, opacity: resolved.opacity ?? 1.0 }
+          );
         }
       }
 
-      // ── Capture composited canvas for L1 cache (async, non-blocking) ────
+      // Capture composited canvas → L1 cache.
       if (this._engine && this._seqId && this._player) {
-        const editGen = this._engine.get_edit_generation?.(this._seqId) ?? 0;
-        const frameDuration = frameDurationUs(this._fps);
-        const frameIndex = Math.round(pts / frameDuration);
+        const editGen    = this._engine.get_edit_generation?.(this._seqId) ?? 0;
+        const frameIndex = Math.round(pts / frameDurationUs(this._fps));
         const w = this._seqW, h = this._seqH;
-        // finish() blocks until all pending GPU commands complete, ensuring
-        // createImageBitmap captures the current frame — not the previous one.
         const gl = this._player.getGLContext?.();
         if (gl) gl.finish();
         createImageBitmap(this._player.canvas).then((bm) => {
-          this._compositionCache.set(this._seqId, editGen, frameIndex, { bitmap: bm, width: w, height: h });
-        }).catch(() => {}); // Non-fatal if capture fails
+          const entry = { bitmap: bm, width: w, height: h };
+          this._compositionCache.set(this._seqId, editGen, frameIndex, entry);
+          this._lastDisplayedBitmap = entry;
+        }).catch(() => {});
       }
 
       this._onFrameState?.(true);
     } catch (e) {
-      console.warn('[Playback] decode error:', e); // eslint-disable-line no-console
+      console.warn('[Playback] _decodeAndDisplay error:', e); // eslint-disable-line no-console
+    }
+  }
+
+  // ── Internal helpers ──────────────────────────────────────────────────────
+
+  _computeTransform(sourcePath, resolved) {
+    const info   = this._pool.getInfo(sourcePath);
+    const clipW  = info?.width  ?? this._seqW;
+    const clipH  = info?.height ?? this._seqH;
+    const scaleX = (clipW / this._seqW) * (resolved.userScale ?? 1.0);
+    const scaleY = (clipH / this._seqH) * (resolved.userScale ?? 1.0);
+    const offsetX =  (resolved.posX ?? 0) / (this._seqW / 2);
+    const offsetY = -(resolved.posY ?? 0) / (this._seqH / 2);
+    return { scaleX, scaleY, offsetX, offsetY };
+  }
+
+  _updateTimelineDisplay(pts) {
+    if (this._timeline) {
+      this._timeline._playhead = pts;
+      this._timeline.render();
     }
   }
 }
@@ -578,7 +682,7 @@ export class Playback {
  * @returns {Promise<object|null>}
  */
 async function _toImageBitmapIfNeeded(frameData) {
-  if (!frameData?.videoFrame) return frameData;   // YUV path — no conversion needed
+  if (!frameData?.videoFrame) return frameData;  // YUV path — no conversion needed
   const { videoFrame, width, height } = frameData;
   try {
     const bitmap = await createImageBitmap(videoFrame);

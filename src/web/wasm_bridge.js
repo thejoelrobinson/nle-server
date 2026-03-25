@@ -278,6 +278,19 @@ export class FrameServerBridge {
   }
 
   /**
+   * Decode the next sequential frame without seeking.
+   * Uses the WASM path directly (WebCodecs is packet-based and doesn't
+   * support stateless sequential read without re-initialising the decoder).
+   * Returns a YUV frame object {y,u,v,width,height,strideY,strideU,strideV,pts}
+   * or null at end of stream / on error.
+   * @returns {object|null}
+   */
+  decodeNextFrame() {
+    if (!this._server) return null;
+    return this._server.decode_next_frame() || null;
+  }
+
+  /**
    * Return stream metadata from the currently open file.
    * Must be called after openFile() succeeds.
    * @returns {object|null}
@@ -588,6 +601,37 @@ export class FrameServerPool {
    */
   getBridge(sourcePath) {
     return this._pool.get(sourcePath)?.bridge ?? null;
+  }
+
+  /**
+   * Decode the next sequential frame from the given source (no seek overhead).
+   * If expectedSecs is provided and the decoded frame's pts is more than
+   * 1.5 frame-durations away from it, falls back to decodeFrameAt to
+   * reposition the decoder (handles clip boundaries and source-fps mismatches).
+   * @param {string}  sourcePath
+   * @param {number}  [expectedSecs] — validate decoded pts against this
+   * @param {boolean} [useProxy=true]
+   * @returns {Promise<object|null>}
+   */
+  async decodeNextFrame(sourcePath, expectedSecs = null, useProxy = true) {
+    const entry = this._pool.get(sourcePath);
+    if (!entry) return null;
+    const bridge = (useProxy && entry.proxyBridge) ? entry.proxyBridge : entry.bridge;
+
+    const result = bridge.decodeNextFrame();
+    if (!result) return null;
+
+    // Validate pts if caller provided an expected position.
+    if (expectedSecs !== null && typeof result.pts === 'number') {
+      const fps       = bridge.fps || 24;
+      const tolerance = 1.5 / fps;
+      if (Math.abs(result.pts - expectedSecs) > tolerance) {
+        // Decoder is out of position — reposition with a random-access seek.
+        return bridge.decodeFrameAt(expectedSecs);
+      }
+    }
+
+    return result;
   }
 
   /**
