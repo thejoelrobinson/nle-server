@@ -337,8 +337,12 @@ export class Playback {
           }).catch(() => {}); // Non-fatal if capture fails
         }
       } else {
-        // Cache miss — fire async decode
-        this._decodeAndDisplay(this._playheadPts, allResolved);
+        // Cache miss — _decodeLoop will populate the cache; hold the last drawn
+        // frame until it does.  Do NOT call _decodeAndDisplay here: it runs
+        // this._player.clear() synchronously (before any await), painting a
+        // black canvas between rAF ticks (the "high-contrast flash"), and then
+        // draws the frame a second time after _decodeLoop has already caused the
+        // next _tick to draw it from cache (double-draw).
       }
     }
 
