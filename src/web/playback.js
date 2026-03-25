@@ -396,9 +396,9 @@ export class Playback {
     }
 
     // ── L2 Frame Cache lookup — nearest-frame selection ────────────────────
-    const allResolved = this._engine && this._seqId
+    const allResolved = (this._engine && this._seqId
       ? this._engine.resolve_all_frames(this._seqId, this._playheadPts)
-      : [];
+      : null) ?? [];
 
     if (allResolved.length === 0) {
       // No clips under playhead.
@@ -495,51 +495,59 @@ export class Playback {
    */
   async _decodeLoop() {
     while (this._isPlaying) {
-      const prefetchAheadUs = this._prefetchAheadMs * 1000;
+      try {
+        const prefetchAheadUs = this._prefetchAheadMs * 1000;
 
-      if ((this._nextDecodePts - this._playheadPts) < prefetchAheadUs) {
-        const targetPts = this._nextDecodePts;
+        if ((this._nextDecodePts - this._playheadPts) < prefetchAheadUs) {
+          const targetPts = this._nextDecodePts;
 
-        // Don't decode past end of sequence.
-        if (this._duration > 0 && targetPts > this._duration) {
-          await new Promise((r) => setTimeout(r, 0));
-          continue;
-        }
-
-        const allResolved = this._engine?.resolve_all_frames(this._seqId, targetPts) ?? [];
-
-        for (const resolved of allResolved) {
-          if (!this._isPlaying) break;
-
-          const sourcePts = Math.round(resolved.source_pts);
-          // Skip if already cached (nearest-frame check avoids re-decoding same frame).
-          if (this._findNearestFrame(resolved.source_path, sourcePts)) continue;
-
-          let frameData;
-          try {
-            // Sequential path: no seek overhead.
-            // Pool falls back to decodeFrameAt internally if the decoded
-            // frame's pts is too far from the expected position.
-            frameData = await this._pool.decodeNextFrame(
-              resolved.source_path,
-              usToSecs(resolved.source_pts)
-            );
-          } catch (e) {
-            console.warn('[Playback] _decodeLoop decode error (skipping frame):', e); // eslint-disable-line no-console
-            frameData = null;
+          // Don't decode past end of sequence.
+          if (this._duration > 0 && targetPts > this._duration) {
+            await new Promise((r) => setTimeout(r, 100));
+            continue;
           }
 
-          if (!frameData) continue;
+          const allResolved = this._engine?.resolve_all_frames(this._seqId, targetPts) ?? [];
 
-          try {
-            const cached = await _toImageBitmapIfNeeded(frameData);
-            if (cached) this._setCacheEntry(resolved.source_path, sourcePts, cached);
-          } catch (e) {
-            console.warn('[Playback] _decodeLoop bitmap error (skipping frame):', e); // eslint-disable-line no-console
+          for (const resolved of allResolved) {
+            if (!this._isPlaying) break;
+
+            const sourcePts = Math.round(resolved.source_pts);
+            // Use exact-match check so we never treat an adjacent cached frame as
+            // covering this position — that would cause every other frame to be
+            // skipped, leaving half the cache empty and causing a freeze.
+            const cacheMap = this._getCacheMap(resolved.source_path);
+            if (cacheMap.has(sourcePts)) continue;
+
+            let frameData;
+            try {
+              // Sequential path: no seek overhead.
+              // Pool falls back to decodeFrameAt internally if the decoded
+              // frame's pts is too far from the expected position.
+              frameData = await this._pool.decodeNextFrame(
+                resolved.source_path,
+                usToSecs(resolved.source_pts)
+              );
+            } catch (e) {
+              console.warn('[Playback] _decodeLoop decode error (skipping frame):', e); // eslint-disable-line no-console
+              frameData = null;
+            }
+
+            if (!frameData) continue;
+
+            try {
+              const cached = await _toImageBitmapIfNeeded(frameData);
+              if (cached) this._setCacheEntry(resolved.source_path, sourcePts, cached);
+            } catch (e) {
+              console.warn('[Playback] _decodeLoop bitmap error (skipping frame):', e); // eslint-disable-line no-console
+            }
           }
-        }
 
-        this._nextDecodePts += this._frameDurationUs;
+          this._nextDecodePts += this._frameDurationUs;
+        }
+      } catch (e) {
+        // Catch any unexpected error so the loop never silently exits.
+        console.warn('[Playback] _decodeLoop unexpected error (continuing):', e); // eslint-disable-line no-console
       }
 
       // Yield to the event loop so rAF callbacks and microtasks are not starved.
