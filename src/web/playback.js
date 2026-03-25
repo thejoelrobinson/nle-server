@@ -124,6 +124,8 @@ export class Playback {
     // Cache colorspace lookup: only re-query when source file changes
     this._lastResolvedSourcePath = null;
     this._lastColorspace         = 0;
+
+    this._decoding = false;
   }
 
   // ── Getters ───────────────────────────────────────────────────────────────
@@ -173,6 +175,7 @@ export class Playback {
     if (!this._isPlaying) return;
     this._isPlaying   = false;   // also stops _decodeLoop
     this._lastFrameMs = null;
+    this._decoding    = false;
     if (this._rafId !== null) { cancelAnimationFrame(this._rafId); this._rafId = null; }
     this._audio.stop();
     this._onStateChange?.(false);
@@ -204,6 +207,7 @@ export class Playback {
    */
   syncPlayheadPts(pts) {
     this._playheadPts            = pts;
+    this._decoding               = false;
     this._lastResolvedSourcePath = null;  // invalidate colorspace cache on seek
     this._updateTimelineDisplay(pts);
     this._onTimecode?.(pts);
@@ -337,12 +341,12 @@ export class Playback {
           }).catch(() => {}); // Non-fatal if capture fails
         }
       } else {
-        // Cache miss — _decodeLoop will populate the cache; hold the last drawn
-        // frame until it does.  Do NOT call _decodeAndDisplay here: it runs
-        // this._player.clear() synchronously (before any await), painting a
-        // black canvas between rAF ticks (the "high-contrast flash"), and then
-        // draws the frame a second time after _decodeLoop has already caused the
-        // next _tick to draw it from cache (double-draw).
+        // Cache miss — trigger an async decode if one isn't already in flight.
+        // The _decoding flag prevents concurrent decode calls piling up.
+        if (!this._decoding) {
+          this._decoding = true;
+          this._decodeAndDisplay(pts, allResolved).finally(() => { this._decoding = false; });
+        }
       }
     }
 
@@ -501,9 +505,8 @@ export class Playback {
         }
       }
 
-      // Decode and composite all clips
-      if (this._player) this._player.clear();
-
+      // Decode and composite all clips. Old frame stays visible until new one
+      // is ready — no clear() before awaits to avoid black flash.
       for (const resolved of allResolved) {
         const sourcePts = Math.round(resolved.source_pts);
         let frame = this._cache.get(resolved.source_path, sourcePts);
