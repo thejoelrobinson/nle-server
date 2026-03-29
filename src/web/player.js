@@ -135,13 +135,11 @@ export class Player {
     if (!gl) throw new Error('WebGL not supported');
     this.gl = gl;
 
-    // Track whether textures have been allocated so we can use texSubImage2D
-    // (no GPU realloc) for subsequent same-size uploads.  Saves ~3 × 8 MB of
-    // driver-side reallocation every frame for 4K sources.
-    this._textureInitialized     = false;
-    this._rgbaTextureInitialized = false;
-    this._lastYuvWidth = 0;      // Track last YUV dimensions for safety checks
-    this._lastYuvHeight = 0;
+    // Track allocated texture dimensions so we can use texSubImage2D
+    // (no GPU realloc) for same-size uploads.  Saves ~3 × 8 MB of driver-side
+    // reallocation every frame for 4K sources.  {w:0, h:0} = not yet allocated.
+    this._yuvDims  = { w: 0, h: 0 };
+    this._rgbaInit = false;
 
     // Sequence mode: when true, canvas is locked to sequence resolution
     this._seqMode = false;
@@ -326,10 +324,8 @@ export class Player {
     this.width = seqW;
     this.height = seqH;
     this.gl.viewport(0, 0, seqW, seqH);
-    this._textureInitialized = false;
-    this._rgbaTextureInitialized = false;
-    this._lastYuvWidth = 0;  // Reset dimension tracking
-    this._lastYuvHeight = 0;
+    this._yuvDims  = { w: 0, h: 0 };
+    this._rgbaInit = false;
   }
 
   /**
@@ -345,14 +341,6 @@ export class Player {
       return;
     }
     this._drawYUV(frameData);
-  }
-
-  /**
-   * Alias for drawFrameFull (for backward compatibility with existing code/tests).
-   * @deprecated Use drawFrameFull or drawFrameAt instead.
-   */
-  drawFrame(frameData) {
-    return this.drawFrameFull(frameData);
   }
 
   /**
@@ -428,11 +416,11 @@ export class Player {
   _uploadBitmap(bitmap, width, height) {
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, this.textureRgba);
-    if (this._rgbaTextureInitialized) {
+    if (this._rgbaInit) {
       gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
     } else {
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
-      this._rgbaTextureInitialized = true;
+      this._rgbaInit = true;
     }
   }
 
@@ -453,8 +441,8 @@ export class Player {
       gl.viewport(0, 0, width, height);
       this.width  = width;
       this.height = height;
-      this._rgbaTextureInitialized = false;
-      this._textureInitialized     = false;   // YUV textures now wrong size too
+      this._rgbaInit = false;
+      this._yuvDims  = { w: 0, h: 0 };
     }
 
     this._uploadBitmap(bitmap, width, height);
@@ -486,18 +474,14 @@ export class Player {
    * @param {{ y, u, v, width, height, strideY, strideU, strideV }} frame
    */
   _uploadYUV({ y, u, v, width, height, strideY, strideU, strideV }) {
-    // Safety check: if frame dimensions changed, force reallocation
-    let isUpdate = this._textureInitialized;
-    if (width !== this._lastYuvWidth || height !== this._lastYuvHeight) {
-      isUpdate = false;  // Force texImage2D reallocation
-      this._lastYuvWidth = width;
-      this._lastYuvHeight = height;
-    }
+    // isUpdate = true → reuse existing GPU allocation (texSubImage2D, no realloc).
+    // isUpdate = false → allocate new GPU storage (texImage2D) when dims change or first upload.
+    const isUpdate = width === this._yuvDims.w && height === this._yuvDims.h;
+    if (!isUpdate) this._yuvDims = { w: width, h: height };
 
     this._uploadPlane(this.textureY, y, width,    height,    strideY, isUpdate);
     this._uploadPlane(this.textureU, u, width>>1, height>>1, strideU, isUpdate);
     this._uploadPlane(this.textureV, v, width>>1, height>>1, strideV, isUpdate);
-    this._textureInitialized = true;
   }
 
   /**
@@ -516,8 +500,8 @@ export class Player {
       gl.viewport(0, 0, width, height);
       this.width  = width;
       this.height = height;
-      this._textureInitialized     = false;
-      this._rgbaTextureInitialized = false;   // RGBA texture now wrong size too
+      this._yuvDims  = { w: 0, h: 0 };
+      this._rgbaInit = false;
     }
 
     // Upload the three planes.  Use texSubImage2D (no GPU realloc) for

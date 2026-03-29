@@ -48,14 +48,7 @@ export function initMediaBin() {
   let   lastClickIdx    = -1;   // for shift-range anchor
 
   let   srcPlayer  = null;
-  let   srcPts     = 0;   // current source pts in seconds
-  let   srcDur     = 0;
-  let   srcFps     = 24;
-  let   srcInPts   = 0;   // I-point (seconds)
-  let   srcOutPts  = 0;   // O-point (seconds)
-  let   srcPlaying = false;
-  let   srcRafId   = null;
-  let   srcLastMs  = null;
+  const _src = { playing: false, pts: 0, dur: 0, fps: 24, inPts: 0, outPts: 0, rafId: null, lastMs: null };
 
   // ── Source Monitor WebGL player ────────────────────────────────────────
 
@@ -73,32 +66,32 @@ export function initMediaBin() {
     if (!clip) return;
     const frame = await pool.decodeFrameAt(clip.file.name, pts);
     if (frame && ensureSrcPlayer()) srcPlayer.drawFrameFull(frame);
-    if (sourceTc) sourceTc.textContent = formatTimecode(pts, srcFps);
+    if (sourceTc) sourceTc.textContent = formatTimecode(pts, _src.fps);
   }
 
   function startSrcPlay() {
-    if (srcPlaying) return;
-    srcPlaying = true;
+    if (_src.playing) return;
+    _src.playing = true;
     if (btnSrcPlay) btnSrcPlay.textContent = '⏸';
-    srcLastMs = null;
+    _src.lastMs = null;
     function tick(now) {
-      if (!srcPlaying) return;
-      if (srcLastMs !== null) {
-        srcPts = Math.min(srcDur, srcPts + (now - srcLastMs) / 1000);
-        if (srcPts >= srcDur) { stopSrcPlay(); renderSourceFrame(srcPts); return; }
+      if (!_src.playing) return;
+      if (_src.lastMs !== null) {
+        _src.pts = Math.min(_src.dur, _src.pts + (now - _src.lastMs) / 1000);
+        if (_src.pts >= _src.dur) { stopSrcPlay(); renderSourceFrame(_src.pts); return; }
       }
-      srcLastMs = now;
-      renderSourceFrame(srcPts);
-      srcRafId = requestAnimationFrame(tick);
+      _src.lastMs = now;
+      renderSourceFrame(_src.pts);
+      _src.rafId = requestAnimationFrame(tick);
     }
-    srcRafId = requestAnimationFrame(tick);
+    _src.rafId = requestAnimationFrame(tick);
   }
 
   function stopSrcPlay() {
-    srcPlaying = false;
-    srcLastMs  = null;
+    _src.playing = false;
+    _src.lastMs  = null;
     if (btnSrcPlay) btnSrcPlay.textContent = '▶';
-    if (srcRafId !== null) { cancelAnimationFrame(srcRafId); srcRafId = null; }
+    if (_src.rafId !== null) { cancelAnimationFrame(_src.rafId); _src.rafId = null; }
   }
 
   // ── Open a clip in Source Monitor ──────────────────────────────────────
@@ -115,16 +108,16 @@ export function initMediaBin() {
 
     activeIdx = idx;
     stopSrcPlay();
-    srcPts    = 0;
-    srcDur    = clip.duration;
-    srcFps    = clip.fps;
-    srcInPts  = 0;
-    srcOutPts = clip.duration;
+    _src.pts    = 0;
+    _src.dur    = clip.duration;
+    _src.fps    = clip.fps;
+    _src.inPts  = 0;
+    _src.outPts = clip.duration;
 
     if (sourceEmpty)    sourceEmpty.classList.add('hidden');
     if (sourceClipName) sourceClipName.textContent = clip.file.name;
-    if (sourceDur)      sourceDur.textContent  = formatTimecode(srcDur, srcFps);
-    if (sourceTc)       sourceTc.textContent   = formatTimecode(0, srcFps);
+    if (sourceDur)      sourceDur.textContent  = formatTimecode(_src.dur, _src.fps);
+    if (sourceTc)       sourceTc.textContent   = formatTimecode(0, _src.fps);
 
     [btnSrcPlay, btnSrcBack, btnSrcFwd, btnSrcMarkIn, btnSrcMarkOut, btnInsert, btnOverwrite]
       .forEach((b) => { if (b) b.disabled = false; });
@@ -274,11 +267,14 @@ export function initMediaBin() {
     const { pool } = window._nle ?? {};
     if (!pool) return;
 
+    const proxyStatusCache = new Map();
     pool.onProxyProgress = (path, cur, total) => {
       const pct = total > 0 ? Math.round((cur / total) * 100) : 0;
-      const el  = document.querySelector(
-        `[data-path="${CSS.escape(path)}"] .proxy-status`
-      );
+      if (!proxyStatusCache.has(path)) {
+        const el = document.querySelector(`[data-path="${CSS.escape(path)}"] .proxy-status`);
+        if (el) proxyStatusCache.set(path, el);
+      }
+      const el = proxyStatusCache.get(path);
       if (el) el.textContent = cur >= total ? '✓ proxy' : `proxy ${pct}%`;
     };
 
@@ -397,20 +393,20 @@ export function initMediaBin() {
   // ── Source Monitor transport ───────────────────────────────────────────
 
   if (btnSrcPlay) btnSrcPlay.addEventListener('click', () => {
-    if (srcPlaying) stopSrcPlay(); else startSrcPlay();
+    if (_src.playing) stopSrcPlay(); else startSrcPlay();
   });
   if (btnSrcBack) btnSrcBack.addEventListener('click', () => {
     stopSrcPlay();
-    srcPts = Math.max(0, srcPts - (srcFps > 0 ? 1 / srcFps : 1 / 24));
-    renderSourceFrame(srcPts);
+    _src.pts = Math.max(0, _src.pts - (_src.fps > 0 ? 1 / _src.fps : 1 / 24));
+    renderSourceFrame(_src.pts);
   });
   if (btnSrcFwd) btnSrcFwd.addEventListener('click', () => {
     stopSrcPlay();
-    srcPts = Math.min(srcDur, srcPts + (srcFps > 0 ? 1 / srcFps : 1 / 24));
-    renderSourceFrame(srcPts);
+    _src.pts = Math.min(_src.dur, _src.pts + (_src.fps > 0 ? 1 / _src.fps : 1 / 24));
+    renderSourceFrame(_src.pts);
   });
-  if (btnSrcMarkIn)  btnSrcMarkIn.addEventListener('click',  () => { srcInPts  = srcPts; });
-  if (btnSrcMarkOut) btnSrcMarkOut.addEventListener('click', () => { srcOutPts = srcPts; });
+  if (btnSrcMarkIn)  btnSrcMarkIn.addEventListener('click',  () => { _src.inPts  = _src.pts; });
+  if (btnSrcMarkOut) btnSrcMarkOut.addEventListener('click', () => { _src.outPts = _src.pts; });
 
   // ── Insert / Overwrite ────────────────────────────────────────────────
 
@@ -421,8 +417,8 @@ export function initMediaBin() {
       detail: {
         file:       clip.file,
         trackIndex: 0,
-        inPts:      Math.round(srcInPts  * 1e6),
-        outPts:     Math.round(srcOutPts * 1e6),
+        inPts:      Math.round(_src.inPts  * 1e6),
+        outPts:     Math.round(_src.outPts * 1e6),
         overwrite,
       },
     }));
@@ -436,8 +432,8 @@ export function initMediaBin() {
   document.addEventListener('keydown', (e) => {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
     if (activeIdx < 0) return;
-    if (e.code === 'KeyI') { srcInPts  = srcPts; }
-    if (e.code === 'KeyO') { srcOutPts = srcPts; }
+    if (e.code === 'KeyI') { _src.inPts  = _src.pts; }
+    if (e.code === 'KeyO') { _src.outPts = _src.pts; }
   });
 
   // ── Cross-module: show clip in source from timeline dblclick ──────────

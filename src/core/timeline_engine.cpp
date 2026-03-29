@@ -93,6 +93,12 @@ void TimelineEngine::sort_track(Track& t) {
               });
 }
 
+void TimelineEngine::sorted_insert_clip(Track& t, ClipRef c) {
+    auto pos = std::lower_bound(t.clips.begin(), t.clips.end(), c.timeline_in_pts,
+        [](const ClipRef& a, int64_t pts) { return a.timeline_in_pts < pts; });
+    t.clips.insert(pos, std::move(c));
+}
+
 // ---------------------------------------------------------------------------
 // Sequence management
 // ---------------------------------------------------------------------------
@@ -156,8 +162,7 @@ std::string TimelineEngine::add_clip(const std::string& seq_id,
     const size_t tidx   = static_cast<size_t>(track_index);
 
     std::string id = clip.clip_id;
-    track->clips.push_back(std::move(clip));
-    sort_track(*track);
+    sorted_insert_clip(*track, std::move(clip));
 
     clip_index_[id] = { seq_id, is_video, tidx };
     _bump_gen(seq_id);
@@ -194,7 +199,7 @@ bool TimelineEngine::move_clip(const std::string& clip_id,
     }
 
     if (old_track != new_track) {
-        // Move between tracks: copy clip, erase from old, add to new
+        // Move between tracks: copy clip, erase from old, sorted-insert into new
         ClipRef moved = *clip;
         old_track->clips.erase(
             std::remove_if(old_track->clips.begin(), old_track->clips.end(),
@@ -204,15 +209,20 @@ bool TimelineEngine::move_clip(const std::string& clip_id,
         moved.timeline_in_pts  = new_timeline_in_pts;
         moved.timeline_out_pts = new_out;
         moved.track_index      = new_track_index;
-        new_track->clips.push_back(std::move(moved));
-        sort_track(*new_track);
+        sorted_insert_clip(*new_track, std::move(moved));
 
         loc.track_idx = static_cast<size_t>(new_track_index);
     } else {
-        clip->timeline_in_pts  = new_timeline_in_pts;
-        clip->timeline_out_pts = new_out;
-        clip->track_index      = new_track_index;
-        sort_track(*old_track);
+        // Same track: erase, update, re-insert at correct sorted position
+        ClipRef moved = *clip;
+        moved.timeline_in_pts  = new_timeline_in_pts;
+        moved.timeline_out_pts = new_out;
+        moved.track_index      = new_track_index;
+        old_track->clips.erase(
+            std::remove_if(old_track->clips.begin(), old_track->clips.end(),
+                           [&](const ClipRef& c){ return c.clip_id == clip_id; }),
+            old_track->clips.end());
+        sorted_insert_clip(*old_track, std::move(moved));
     }
 
     _bump_gen(loc.seq_id);
@@ -279,8 +289,7 @@ bool TimelineEngine::split_clip(const std::string& clip_id,
     // Register the second half
     ClipLocation loc = clip_index_[clip_id];  // copy
     std::string second_id = second.clip_id;
-    track->clips.push_back(std::move(second));
-    sort_track(*track);
+    sorted_insert_clip(*track, std::move(second));
 
     clip_index_[second_id] = loc;
     _bump_gen(loc.seq_id);
@@ -415,23 +424,26 @@ emscripten::val TimelineEngine::resolve_frame(const std::string& seq_id,
         const Track& track = seq.video_tracks[static_cast<size_t>(i)];
         if (!track.visible || track.muted) continue;
 
-        for (const auto& clip : track.clips) {
-            if (timeline_pts >= clip.timeline_in_pts &&
-                timeline_pts <  clip.timeline_out_pts) {
-                int64_t offset_seq  = timeline_pts - clip.timeline_in_pts;
-                int64_t offset_clip = av_rescale_q(
-                    offset_seq,
-                    AVRational{1, 1000000},
-                    AVRational{clip.tb_num, clip.tb_den}
-                );
-                int64_t source_pts  = clip.source_in_pts + offset_clip;
+        // Binary search: find last clip whose timeline_in_pts <= timeline_pts
+        auto it = std::upper_bound(track.clips.begin(), track.clips.end(), timeline_pts,
+            [](int64_t pts, const ClipRef& c) { return pts < c.timeline_in_pts; });
+        if (it == track.clips.begin()) continue;
+        --it;
+        if (timeline_pts < it->timeline_out_pts) {
+            const ClipRef& clip = *it;
+            int64_t offset_seq  = timeline_pts - clip.timeline_in_pts;
+            int64_t offset_clip = av_rescale_q(
+                offset_seq,
+                AVRational{1, 1000000},
+                AVRational{clip.tb_num, clip.tb_den}
+            );
+            int64_t source_pts  = clip.source_in_pts + offset_clip;
 
-                emscripten::val result = emscripten::val::object();
-                result.set("source_path", emscripten::val(clip.source_path));
-                result.set("source_pts",  emscripten::val(static_cast<double>(source_pts)));
-                result.set("colorspace",  emscripten::val(clip.colorspace));
-                return result;
-            }
+            emscripten::val result = emscripten::val::object();
+            result.set("source_path", emscripten::val(clip.source_path));
+            result.set("source_pts",  emscripten::val(static_cast<double>(source_pts)));
+            result.set("colorspace",  emscripten::val(clip.colorspace));
+            return result;
         }
     }
     return emscripten::val::null();
@@ -451,32 +463,34 @@ emscripten::val TimelineEngine::resolve_all_frames(const std::string& seq_id,
         const Track& t = seq.video_tracks[i];
         if (!t.visible || t.muted) continue;
 
-        for (const auto& c : t.clips) {
-            if (timeline_pts >= c.timeline_in_pts && timeline_pts < c.timeline_out_pts) {
-                // Rescale to clip timebase
-                int64_t offset_seq = timeline_pts - c.timeline_in_pts;
-                int64_t offset_clip = av_rescale_q(
-                    offset_seq,
-                    AVRational{1, 1000000},
-                    AVRational{c.tb_num, c.tb_den}
-                );
-                int64_t source_pts = c.source_in_pts + offset_clip;
+        // Binary search: find last clip whose timeline_in_pts <= timeline_pts
+        auto it = std::upper_bound(t.clips.begin(), t.clips.end(), timeline_pts,
+            [](int64_t pts, const ClipRef& c) { return pts < c.timeline_in_pts; });
+        if (it == t.clips.begin()) continue;
+        --it;
+        if (timeline_pts < it->timeline_out_pts) {
+            const ClipRef& c = *it;
+            int64_t offset_seq = timeline_pts - c.timeline_in_pts;
+            int64_t offset_clip = av_rescale_q(
+                offset_seq,
+                AVRational{1, 1000000},
+                AVRational{c.tb_num, c.tb_den}
+            );
+            int64_t source_pts = c.source_in_pts + offset_clip;
 
-                emscripten::val entry = emscripten::val::object();
-                entry.set("source_path", emscripten::val(c.source_path));
-                entry.set("source_pts",  emscripten::val(static_cast<double>(source_pts)));
-                entry.set("colorspace",  emscripten::val(c.colorspace));
-                entry.set("opacity",     emscripten::val(c.opacity * t.opacity));  // Combine clip + track opacity
-                entry.set("posX",        emscripten::val(c.posX));
-                entry.set("posY",        emscripten::val(c.posY));
-                entry.set("anchorX",     emscripten::val(c.anchorX));
-                entry.set("anchorY",     emscripten::val(c.anchorY));
-                entry.set("userScale",   emscripten::val(c.userScale));
-                entry.set("blendMode",   emscripten::val(c.blendMode));
-                entry.set("clip_id",     emscripten::val(c.clip_id));
-                result.set(push_idx++, entry);
-                break; // one clip per track per PTS
-            }
+            emscripten::val entry = emscripten::val::object();
+            entry.set("source_path", emscripten::val(c.source_path));
+            entry.set("source_pts",  emscripten::val(static_cast<double>(source_pts)));
+            entry.set("colorspace",  emscripten::val(c.colorspace));
+            entry.set("opacity",     emscripten::val(c.opacity * t.opacity));
+            entry.set("posX",        emscripten::val(c.posX));
+            entry.set("posY",        emscripten::val(c.posY));
+            entry.set("anchorX",     emscripten::val(c.anchorX));
+            entry.set("anchorY",     emscripten::val(c.anchorY));
+            entry.set("userScale",   emscripten::val(c.userScale));
+            entry.set("blendMode",   emscripten::val(c.blendMode));
+            entry.set("clip_id",     emscripten::val(c.clip_id));
+            result.set(push_idx++, entry);
         }
     }
     return result;
@@ -490,16 +504,17 @@ int64_t TimelineEngine::get_sequence_duration(const std::string& seq_id) {
     auto sit = sequences_.find(seq_id);
     if (sit == sequences_.end()) return 0;
 
+    // Clips are sorted and non-overlapping, so the last clip per track has the
+    // greatest timeline_out_pts.  One back() per track instead of a full scan.
     const Sequence& seq = sit->second;
     int64_t max_out = 0;
-
-    auto scan = [&](const std::vector<Track>& tracks) {
+    auto check = [&](const std::vector<Track>& tracks) {
         for (const auto& t : tracks)
-            for (const auto& c : t.clips)
-                if (c.timeline_out_pts > max_out) max_out = c.timeline_out_pts;
+            if (!t.clips.empty() && t.clips.back().timeline_out_pts > max_out)
+                max_out = t.clips.back().timeline_out_pts;
     };
-    scan(seq.video_tracks);
-    scan(seq.audio_tracks);
+    check(seq.video_tracks);
+    check(seq.audio_tracks);
     return max_out;
 }
 

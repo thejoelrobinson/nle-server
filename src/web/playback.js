@@ -97,6 +97,7 @@ export class Playback {
     this._nextDecodePts   = 0;               // µs — next position to decode
     this._prefetchAheadMs = PREFETCH_AHEAD_MS;
     this._loopGeneration  = 0;               // incremented on each play() to invalidate stale loops
+    this._consecutiveDecodeErrors = 0;       // hot-spin guard
 
     this._onStateChange = onPlayStateChange;
     this._onTimecode    = onTimecodeUpdate;
@@ -428,38 +429,14 @@ export class Playback {
       });
 
       if (allCached) {
-        // All clips in cache — composite and draw.
         this._player.clear();
         for (const resolved of allResolved) {
-          const sourcePts  = Math.round(resolved.source_pts);
-          const frame      = this._findNearestFrame(resolved.source_path, sourcePts);
-          if (frame) {
-            const transform  = this._computeTransform(resolved.source_path, resolved);
-            const colorspace = mapFFmpegColorspace(
-              this._pool.getInfo(resolved.source_path)?.colorspace ?? AVCOL_SPC_BT709
-            );
-            this._player.drawFrameAt(
-              { ...frame, colorspace },
-              { ...transform, opacity: resolved.opacity ?? 1.0 }
-            );
-          }
+          const sourcePts = Math.round(resolved.source_pts);
+          const frame = this._findNearestFrame(resolved.source_path, sourcePts);
+          if (frame) this._drawClipFrame(frame, resolved);
         }
         this._onFrameState?.(true);
-
-        // Capture composited canvas → L1 cache (async, non-blocking).
-        if (this._engine && this._seqId) {
-          const editGen    = this._engine.get_edit_generation?.(this._seqId) ?? 0;
-          const frameDur   = frameDurationUs(this._fps);
-          const frameIndex = Math.round(this._playheadPts / frameDur);
-          const w = this._seqW, h = this._seqH;
-          const gl = this._player.getGLContext?.();
-          if (gl) gl.finish();
-          createImageBitmap(this._player.canvas).then((bm) => {
-            const entry = { bitmap: bm, width: w, height: h };
-            this._compositionCache.set(this._seqId, editGen, frameIndex, entry);
-            this._lastDisplayedBitmap = entry;
-          }).catch(() => {});
-        }
+        this._captureToL1Cache(this._playheadPts);
       } else {
         // Cache miss — hold the last drawn frame. _decodeLoop will fill
         // the cache; we'll pick up the new frames on the next tick.
@@ -521,7 +498,14 @@ export class Playback {
             continue;
           }
 
-          const allResolved = this._engine?.resolve_all_frames(this._seqId, targetPts) ?? [];
+          let allResolved;
+          try {
+            allResolved = this._engine?.resolve_all_frames(this._seqId, targetPts) ?? [];
+          } catch (e) {
+            console.warn('[DecodeLoop] resolve_all_frames threw at pts', (targetPts / 1e6).toFixed(3), e); // eslint-disable-line no-console
+            allResolved = [];  // treat as gap — fall through, advance _nextDecodePts
+          }
+          if (!Array.isArray(allResolved)) allResolved = [];
 
           for (const resolved of allResolved) {
             if (!this._isPlaying || this._loopGeneration !== generation) break;
@@ -533,49 +517,11 @@ export class Playback {
             const cacheMap = this._getCacheMap(resolved.source_path);
             if (cacheMap.has(sourcePts)) continue;
 
-            let frameData;
-            try {
-              // Sequential path: no seek overhead.
-              // Pool falls back to decodeFrameAt internally if the decoded
-              // frame's pts is too far from the expected position.
-              frameData = await this._pool.decodeNextFrame(
-                resolved.source_path,
-                usToSecs(resolved.source_pts)
-              );
-            } catch (e) {
-              console.warn('[Playback] _decodeLoop decode error (skipping frame):', e); // eslint-disable-line no-console
-              frameData = null;
-            }
-
-            // Check generation after each await point.
+            // Sequential → proxy random-access → direct source fallback chain.
+            const frameData = await this._decodeWithFallback(
+              resolved.source_path, resolved.source_pts, true
+            );
             if (!this._isPlaying || this._loopGeneration !== generation) break;
-
-            if (!frameData) {
-              // fallback: try random-access seek for this pts
-              try {
-                frameData = await this._pool.decodeFrameAt(
-                  resolved.source_path,
-                  usToSecs(resolved.source_pts)
-                );
-              } catch (e) {
-                frameData = null;
-              }
-              if (!this._isPlaying || this._loopGeneration !== generation) break;
-            }
-            if (!frameData) {
-              // Both proxy paths returned null — proxy EOF before actual source end.
-              // Try direct source decode as last resort (useProxy = false).
-              try {
-                frameData = await this._pool.decodeFrameAt(
-                  resolved.source_path,
-                  usToSecs(resolved.source_pts),
-                  false  // bypass proxy, hit SOURCE bridge directly
-                );
-              } catch (e) {
-                frameData = null;
-              }
-              if (!this._isPlaying || this._loopGeneration !== generation) break;
-            }
             if (!frameData) {
               console.warn('[DecodeLoop] All decode paths null for pts', resolved.source_pts, '— skipping'); // eslint-disable-line no-console
               continue;
@@ -584,7 +530,10 @@ export class Playback {
             try {
               const cached = await _toImageBitmapIfNeeded(frameData);
               if (!this._isPlaying || this._loopGeneration !== generation) break;
-              if (cached) this._setCacheEntry(resolved.source_path, sourcePts, cached);
+              if (cached) {
+                this._setCacheEntry(resolved.source_path, sourcePts, cached);
+                this._consecutiveDecodeErrors = 0;
+              }
             } catch (e) {
               console.warn('[Playback] _decodeLoop bitmap error (skipping frame):', e); // eslint-disable-line no-console
             }
@@ -594,7 +543,13 @@ export class Playback {
         }
       } catch (e) {
         // Catch any unexpected error so the loop never silently exits.
-        console.warn('[Playback] _decodeLoop unexpected error (continuing):', e); // eslint-disable-line no-console
+        console.warn('[DecodeLoop] outer catch at pts', (this._nextDecodePts / 1e6).toFixed(3), e); // eslint-disable-line no-console
+        this._nextDecodePts += this._frameDurationUs;  // never get stuck on the same pts
+        this._consecutiveDecodeErrors++;
+        if (this._consecutiveDecodeErrors > 10) {
+          console.error('[DecodeLoop] 10 consecutive errors — breaking loop at pts', (this._nextDecodePts / 1e6).toFixed(3)); // eslint-disable-line no-console
+          break;
+        }
       }
 
       // Yield to the event loop so rAF callbacks and microtasks are not starved.
@@ -657,44 +612,15 @@ export class Playback {
         let frame = this._findNearestFrame(resolved.source_path, sourcePts);
 
         if (!frame) {
-          let frameData;
-          try {
-            frameData = await this._pool.decodeFrameAt(
-              resolved.source_path,
-              usToSecs(resolved.source_pts)
-            );
-          } catch (e) {
-            console.warn('[Playback] _decodeAndDisplay decode error:', e); // eslint-disable-line no-console
-            continue;
-          }
-          frame = await _toImageBitmapIfNeeded(frameData);
+          const frameData = await this._decodeWithFallback(resolved.source_path, resolved.source_pts);
+          frame = frameData ? await _toImageBitmapIfNeeded(frameData) : null;
           if (frame) this._setCacheEntry(resolved.source_path, sourcePts, frame);
         }
 
-        if (frame && this._player) {
-          const info       = this._pool.getInfo(resolved.source_path);
-          const colorspace = mapFFmpegColorspace(info?.colorspace ?? AVCOL_SPC_BT709);
-          const transform  = this._computeTransform(resolved.source_path, resolved);
-          this._player.drawFrameAt(
-            { ...frame, colorspace },
-            { ...transform, opacity: resolved.opacity ?? 1.0 }
-          );
-        }
+        if (frame && this._player) this._drawClipFrame(frame, resolved);
       }
 
-      // Capture composited canvas → L1 cache.
-      if (this._engine && this._seqId && this._player) {
-        const editGen    = this._engine.get_edit_generation?.(this._seqId) ?? 0;
-        const frameIndex = Math.round(pts / frameDurationUs(this._fps));
-        const w = this._seqW, h = this._seqH;
-        const gl = this._player.getGLContext?.();
-        if (gl) gl.finish();
-        createImageBitmap(this._player.canvas).then((bm) => {
-          const entry = { bitmap: bm, width: w, height: h };
-          this._compositionCache.set(this._seqId, editGen, frameIndex, entry);
-          this._lastDisplayedBitmap = entry;
-        }).catch(() => {});
-      }
+      this._captureToL1Cache(pts);
 
       this._onFrameState?.(true);
     } catch (e) {
@@ -703,6 +629,58 @@ export class Playback {
   }
 
   // ── Internal helpers ──────────────────────────────────────────────────────
+
+  // ── Shared helpers ───────────────────────────────────────────────────────
+
+  /** Capture the composited canvas to L1 cache asynchronously (non-blocking). */
+  _captureToL1Cache(pts) {
+    if (!this._engine || !this._seqId || !this._player) return;
+    const editGen    = this._engine.get_edit_generation?.(this._seqId) ?? 0;
+    const frameIndex = Math.round(pts / frameDurationUs(this._fps));
+    const w = this._seqW, h = this._seqH;
+    const gl = this._player.getGLContext?.();
+    if (gl) gl.finish();
+    createImageBitmap(this._player.canvas).then((bm) => {
+      const entry = { bitmap: bm, width: w, height: h };
+      this._compositionCache.set(this._seqId, editGen, frameIndex, entry);
+      this._lastDisplayedBitmap = entry;
+    }).catch(() => {});
+  }
+
+  /** Draw a single decoded frame with its composite transform and colorspace. */
+  _drawClipFrame(frame, resolved) {
+    const info       = this._pool.getInfo(resolved.source_path);
+    const colorspace = mapFFmpegColorspace(info?.colorspace ?? AVCOL_SPC_BT709);
+    const transform  = this._computeTransform(resolved.source_path, resolved);
+    this._player.drawFrameAt(
+      { ...frame, colorspace },
+      { ...transform, opacity: resolved.opacity ?? 1.0 }
+    );
+  }
+
+  /**
+   * Try to decode a frame using the best available path:
+   *   1. Sequential (decodeNextFrame) — only when allowSeq=true
+   *   2. Random-access via proxy (decodeFrameAt with proxy)
+   *   3. Random-access bypassing proxy (decodeFrameAt, useProxy=false)
+   * Returns null if all paths fail.
+   */
+  async _decodeWithFallback(sourcePath, sourcePtsUs, allowSeq = false) {
+    let frameData;
+    if (allowSeq) {
+      try { frameData = await this._pool.decodeNextFrame(sourcePath, usToSecs(sourcePtsUs)); }
+      catch { frameData = null; }
+    }
+    if (!frameData) {
+      try { frameData = await this._pool.decodeFrameAt(sourcePath, usToSecs(sourcePtsUs)); }
+      catch { frameData = null; }
+    }
+    if (!frameData) {
+      try { frameData = await this._pool.decodeFrameAt(sourcePath, usToSecs(sourcePtsUs), false); }
+      catch { frameData = null; }
+    }
+    return frameData;
+  }
 
   _computeTransform(sourcePath, resolved) {
     const info   = this._pool.getInfo(sourcePath);

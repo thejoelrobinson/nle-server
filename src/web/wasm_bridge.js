@@ -270,7 +270,11 @@ export class FrameServerBridge {
    */
   async decodeFrameAt(seconds) {
     if (!this._server) return null;
-    this._pts = Math.max(0, seconds);
+    // Clamp to [0, duration] — mirrors seekTo(). Without this, source_pts values
+    // that land a fraction of a frame past the file's reported duration (common at
+    // clip tails) cause decode_frame_at() to return null, leaving a permanent cache
+    // gap that freezes _tick() on the last displayed frame.
+    this._pts = Math.max(0, this._duration > 0 ? Math.min(seconds, this._duration) : seconds);
     if (this._webcodecs?.ready) {
       return this._decodeFrameWebCodecs(this._pts);
     }
@@ -618,7 +622,18 @@ export class FrameServerPool {
     if (!entry) return null;
     const bridge = (useProxy && entry.proxyBridge) ? entry.proxyBridge : entry.bridge;
 
-    const result = bridge.decodeNextFrame();
+    let result = bridge.decodeNextFrame();
+
+    // If the proxy bridge hit EOF but the source bridge is available, reposition
+    // the source bridge at the expected pts and return its frame directly.  This
+    // avoids the three-fallback round-trip in _decodeLoop which, for slow WASM
+    // codecs, calls decode_frame_at() synchronously for every remaining frame,
+    // blocking the main thread long enough to drain the frame cache (visible as
+    // a sustained freeze until end of clip).
+    if (!result && bridge !== entry.bridge && expectedSecs !== null) {
+      return entry.bridge.decodeFrameAt(expectedSecs);
+    }
+
     if (!result) return null;
 
     // Validate pts if caller provided an expected position.

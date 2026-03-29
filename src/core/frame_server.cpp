@@ -312,11 +312,14 @@ emscripten::val FrameServer::decode_frame_at(double target_seconds) {
     // frames from before the seek point.
     avcodec_flush_buffers(codec_ctx_);
 
-    // Half-frame tolerance handles floating-point imprecision when comparing
-    // decoded PTS against the requested timestamp.
+    // 1.5-frame tolerance: accept frames up to 1.5 frames before the target.
+    // 0.5 frames was too tight — when the seek lands on the last available frame
+    // in the stream (e.g. a 30fps source whose final frame is at 28.2 s and the
+    // requested target is 28.218 s), the frame's PTS just barely missed the old
+    // threshold and decode_frame_at returned null even though a valid frame existed.
+    // 1.5 frames matches the tolerance already used in pool.decodeNextFrame().
     const double fps_val   = get_fps();
-    const double half_frame = fps_val > 0.0 ? 0.5 / fps_val : 0.02;
-    const double threshold  = target_seconds - half_frame;
+    const double threshold = target_seconds - (fps_val > 0.0 ? 1.5 / fps_val : 0.06);
 
     AVStream*    s  = fmt_ctx_->streams[video_stream_idx_];
     const double tb = av_q2d(s->time_base);
@@ -478,14 +481,17 @@ emscripten::val FrameServer::decode_audio_at(double target_seconds, int num_samp
                 swr_get_delay(_swr_ctx, _audio_codec_ctx->sample_rate) + frame->nb_samples,
                 48000, _audio_codec_ctx->sample_rate, AV_ROUND_UP));
 
-            std::vector<float> buf(static_cast<size_t>(out_samples) * 2);
-            uint8_t* out_ptr = reinterpret_cast<uint8_t*>(buf.data());
+            const size_t off = output.size();
+            output.resize(off + static_cast<size_t>(out_samples) * 2);
+            uint8_t* out_ptr = reinterpret_cast<uint8_t*>(output.data() + off);
             int converted = swr_convert(_swr_ctx, &out_ptr, out_samples,
                                         const_cast<const uint8_t**>(frame->extended_data),
                                         frame->nb_samples);
             if (converted > 0) {
-                output.insert(output.end(), buf.begin(), buf.begin() + converted * 2);
+                output.resize(off + static_cast<size_t>(converted) * 2);
                 collected += converted * 2;
+            } else {
+                output.resize(off);
             }
             av_frame_unref(frame);
         }
@@ -735,12 +741,26 @@ emscripten::val FrameServer::generate_proxy(int target_width, int target_height)
                 if (!prx_sws) { av_frame_unref(frame_); have_error = true; break; }
             }
 
+            // Capture source pts before releasing the frame.
+            int64_t src_pts = frame_->best_effort_timestamp;
+            if (src_pts == AV_NOPTS_VALUE) src_pts = frame_->pts;
+
             sws_scale(prx_sws,
                       frame_->data, frame_->linesize, 0, frame_->height,
                       scaled->data, scaled->linesize);
             av_frame_unref(frame_);
 
-            scaled->pts = current_frame;
+            // Stamp the proxy frame with the source's actual pts rescaled to the
+            // proxy time-base.  Using a bare counter (current_frame) caused the
+            // proxy duration to equal frame_count / r_frame_rate, which is shorter
+            // than the real source duration whenever r_frame_rate != actual fps
+            // (VFR files, NTSC variants, etc.).  The mismatch made the proxy hit
+            // EOF early (e.g. at ~24 s for a 30 s clip at 24 fps reported as 30 fps),
+            // forcing every remaining frame through the slow WASM seek path and
+            // freezing the displayed frame until clip end.
+            scaled->pts = (src_pts != AV_NOPTS_VALUE)
+                ? av_rescale_q(src_pts, src_stream->time_base, enc_ctx->time_base)
+                : current_frame;
             if (avcodec_send_frame(enc_ctx, scaled) == 0) {
                 while (avcodec_receive_packet(enc_ctx, enc_pkt) == 0) {
                     enc_pkt->stream_index = 0;

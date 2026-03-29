@@ -128,10 +128,6 @@ function initTimeline() {
     onTimecodeUpdate:  updateTimecodeDisplay,
     onFrameState:      (hasFrame) => setProgramEmpty(!hasFrame),
   });
-  window.__pb     = playback;
-  window.__pool   = pool;
-  window.__engine = _engine;
-
   // When the user scrubs the playhead, pause and sync the Playback engine.
   canvas.addEventListener('playhead-change', (e) => {
     playback.pause();

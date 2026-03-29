@@ -173,7 +173,8 @@ private:
     ClipRef* find_clip_ref(const std::string& clip_id,
                            Track** out_track = nullptr);
 
-    void sort_track(Track& t);
+    void sort_track(Track& t);          // for bulk-insert (JSON load)
+    void sorted_insert_clip(Track& t, ClipRef c); // O(log n) sorted insert for single-clip mutations
 
     // JSON helpers
     nlohmann::json clip_to_json(const ClipRef& c) const;

@@ -68,8 +68,13 @@ export class Timeline {
     this._trimDrag  = null;
     this._handDrag  = null;
 
-    // Resize observer keeps canvas pixel-perfect
-    this._ro = new ResizeObserver(() => this._resize());
+    // Resize observer keeps canvas pixel-perfect; debounced to one frame to
+    // avoid a full redraw on every pixel during panel divider drag.
+    this._resizeTimer = null;
+    this._ro = new ResizeObserver(() => {
+      clearTimeout(this._resizeTimer);
+      this._resizeTimer = setTimeout(() => this._resize(), 16);
+    });
     this._ro.observe(canvas);
     this._resize();
 
@@ -586,28 +591,8 @@ export class Timeline {
         bubbles: true, detail: { clipId: hit.clip.clip_id },
       }));
 
-      // Trim handle?
-      if (hit.trimEdge) {
-        this._trimDrag = {
-          clipId:    hit.clip.clip_id,
-          edge:      hit.trimEdge,  // 'in' | 'out'
-          origIn:    hit.clip.source_in_pts,
-          origOut:   hit.clip.source_out_pts,
-          origTlIn:  hit.clip.timeline_in_pts,
-          origTlOut: hit.clip.timeline_out_pts,
-          startX:    mx,
-        };
-      } else {
-        // Move drag
-        this._drag = {
-          type:      'move',
-          clipId:    hit.clip.clip_id,
-          origTlIn:  hit.clip.timeline_in_pts,
-          origTrack: hit.trackIdx,
-          offsetPts: this._xToPts(mx) - hit.clip.timeline_in_pts,
-          startX:    mx,
-        };
-      }
+      if (hit.trimEdge) this._startTrimDrag(hit, mx);
+      else              this._startMoveDrag(hit, mx);
       this._draw();
     }
   }
@@ -681,6 +666,29 @@ export class Timeline {
       this._canvas.style.cursor = 'grab';
     }
     this._draw();
+  }
+
+  _startTrimDrag(hit, mx) {
+    this._trimDrag = {
+      clipId:    hit.clip.clip_id,
+      edge:      hit.trimEdge,
+      origIn:    hit.clip.source_in_pts,
+      origOut:   hit.clip.source_out_pts,
+      origTlIn:  hit.clip.timeline_in_pts,
+      origTlOut: hit.clip.timeline_out_pts,
+      startX:    mx,
+    };
+  }
+
+  _startMoveDrag(hit, mx) {
+    this._drag = {
+      type:      'move',
+      clipId:    hit.clip.clip_id,
+      origTlIn:  hit.clip.timeline_in_pts,
+      origTrack: hit.trackIdx,
+      offsetPts: this._xToPts(mx) - hit.clip.timeline_in_pts,
+      startX:    mx,
+    };
   }
 
   _onDblClick(e) {
