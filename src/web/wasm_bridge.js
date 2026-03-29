@@ -270,11 +270,7 @@ export class FrameServerBridge {
    */
   async decodeFrameAt(seconds) {
     if (!this._server) return null;
-    // Clamp to [0, duration] — mirrors seekTo(). Without this, source_pts values
-    // that land a fraction of a frame past the file's reported duration (common at
-    // clip tails) cause decode_frame_at() to return null, leaving a permanent cache
-    // gap that freezes _tick() on the last displayed frame.
-    this._pts = Math.max(0, this._duration > 0 ? Math.min(seconds, this._duration) : seconds);
+    this._pts = Math.max(0, seconds);
     if (this._webcodecs?.ready) {
       return this._decodeFrameWebCodecs(this._pts);
     }
@@ -338,9 +334,10 @@ export class FrameServerBridge {
     return this._server.decode_audio_at(targetSecs, numSamples) || null;
   }
 
-  get currentPts() { return this._pts; }
-  get duration()   { return this._duration; }
-  get fps()        { return this._fps; }
+  get currentPts()   { return this._pts; }
+  get duration()     { return this._duration; }
+  get fps()          { return this._fps; }
+  get hasWebCodecs() { return this._webcodecs?.ready ?? false; }
 
   // ── Cleanup ───────────────────────────────────────────────────────────────
 
@@ -594,6 +591,9 @@ export class FrameServerPool {
   async decodeFrameAt(sourcePath, seconds, useProxy = true) {
     const entry = this._pool.get(sourcePath);
     if (!entry) return null;
+    // A random-access seek repositions the proxy, so clear the EOF flag —
+    // subsequent sequential reads can resume from the proxy again.
+    if (useProxy && entry.proxyBridge) entry.proxyEof = false;
     const bridge = (useProxy && entry.proxyBridge) ? entry.proxyBridge : entry.bridge;
     return bridge.decodeFrameAt(seconds);
   }
@@ -620,17 +620,27 @@ export class FrameServerPool {
   async decodeNextFrame(sourcePath, expectedSecs = null, useProxy = true) {
     const entry = this._pool.get(sourcePath);
     if (!entry) return null;
+
+    // Once the proxy has been exhausted, route all sequential reads through
+    // the source bridge directly — avoids a random-access seek on every frame
+    // which is far too slow for realtime H.264/HEVC playback.
+    if (entry.proxyEof) useProxy = false;
+
     const bridge = (useProxy && entry.proxyBridge) ? entry.proxyBridge : entry.bridge;
+
+    // For WebCodecs-capable bridges (H.264, HEVC, VP9, AV1), hardware random-access
+    // is faster and non-blocking compared to synchronous WASM sequential decode.
+    // Skip the blocking WASM call and go straight to decodeFrameAt.
+    if (bridge.hasWebCodecs && expectedSecs !== null) {
+      return bridge.decodeFrameAt(expectedSecs);
+    }
 
     let result = bridge.decodeNextFrame();
 
-    // If the proxy bridge hit EOF but the source bridge is available, reposition
-    // the source bridge at the expected pts and return its frame directly.  This
-    // avoids the three-fallback round-trip in _decodeLoop which, for slow WASM
-    // codecs, calls decode_frame_at() synchronously for every remaining frame,
-    // blocking the main thread long enough to drain the frame cache (visible as
-    // a sustained freeze until end of clip).
+    // Proxy hit EOF — record it and do a one-time seek to reposition the source
+    // bridge; all subsequent calls will use source sequential (fast intra decode).
     if (!result && bridge !== entry.bridge && expectedSecs !== null) {
+      entry.proxyEof = true;
       return entry.bridge.decodeFrameAt(expectedSecs);
     }
 
@@ -642,6 +652,12 @@ export class FrameServerPool {
       const tolerance = 1.5 / fps;
       if (Math.abs(result.pts - expectedSecs) > tolerance) {
         // Decoder is out of position — reposition with a random-access seek.
+        // Use source bridge if this is a proxy bridge and pts is past proxy duration,
+        // to avoid returning a clamped/wrong proxy frame as a valid result.
+        if (bridge !== entry.bridge && expectedSecs > bridge.duration) {
+          entry.proxyEof = true;
+          return entry.bridge.decodeFrameAt(expectedSecs);
+        }
         return bridge.decodeFrameAt(expectedSecs);
       }
     }
