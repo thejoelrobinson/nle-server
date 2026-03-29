@@ -281,7 +281,28 @@ emscripten::val FrameServer::decode_next_frame() {
 
         ret = avcodec_receive_frame(codec_ctx_, frame_);
         if (ret == AVERROR(EAGAIN)) continue;
-        if (ret == AVERROR_EOF)     return emscripten::val::null();
+        if (ret == AVERROR_EOF) {
+            // Decoder drained at stream EOF — seek backward to the last keyframe
+            // and return it (hold-last-frame for clips played to the end).
+            int seek_ret = av_seek_frame(fmt_ctx_, video_stream_idx_,
+                                         INT64_MAX, AVSEEK_FLAG_BACKWARD);
+            if (seek_ret < 0) return emscripten::val::null();
+            avcodec_flush_buffers(codec_ctx_);
+            while (av_read_frame(fmt_ctx_, packet_) >= 0) {
+                if (packet_->stream_index != video_stream_idx_) {
+                    av_packet_unref(packet_);
+                    continue;
+                }
+                int r = avcodec_send_packet(codec_ctx_, packet_);
+                av_packet_unref(packet_);
+                if (r < 0 && r != AVERROR(EAGAIN)) return emscripten::val::null();
+                r = avcodec_receive_frame(codec_ctx_, frame_);
+                if (r == AVERROR(EAGAIN)) continue;
+                if (r < 0) return emscripten::val::null();
+                return _frame_to_result(_consume_frame());
+            }
+            return emscripten::val::null();
+        }
         if (ret < 0)                return emscripten::val::null();
 
         return _frame_to_result(_consume_frame());
@@ -324,6 +345,10 @@ emscripten::val FrameServer::decode_frame_at(double target_seconds) {
     AVStream*    s  = fmt_ctx_->streams[video_stream_idx_];
     const double tb = av_q2d(s->time_base);
 
+    // Track the last successfully decoded frame so we can return it at EOF
+    // instead of null — standard NLE hold-last-frame behaviour.
+    AVFrame* last_good_frame = nullptr;
+
     // Decode forward until we find a frame at or past the target timestamp.
     // Cap iterations to avoid spinning forever on corrupt streams.
     static const int MAX_ITER = 2000;
@@ -332,6 +357,7 @@ emscripten::val FrameServer::decode_frame_at(double target_seconds) {
         if (ret == AVERROR_EOF) {
             avcodec_send_packet(codec_ctx_, nullptr);
         } else if (ret < 0) {
+            if (last_good_frame) av_frame_free(&last_good_frame);
             return emscripten::val::null();
         } else if (packet_->stream_index != video_stream_idx_) {
             av_packet_unref(packet_);
@@ -339,13 +365,27 @@ emscripten::val FrameServer::decode_frame_at(double target_seconds) {
         } else {
             ret = avcodec_send_packet(codec_ctx_, packet_);
             av_packet_unref(packet_);
-            if (ret < 0 && ret != AVERROR(EAGAIN)) return emscripten::val::null();
+            if (ret < 0 && ret != AVERROR(EAGAIN)) {
+                if (last_good_frame) av_frame_free(&last_good_frame);
+                return emscripten::val::null();
+            }
         }
 
         ret = avcodec_receive_frame(codec_ctx_, frame_);
         if (ret == AVERROR(EAGAIN)) continue;
-        if (ret == AVERROR_EOF)     return emscripten::val::null();
-        if (ret < 0)                return emscripten::val::null();
+        if (ret == AVERROR_EOF) {
+            // Decoder drained — return last good frame if available (clip EOF).
+            if (last_good_frame) {
+                av_frame_move_ref(frame_, last_good_frame);
+                av_frame_free(&last_good_frame);
+                return _frame_to_result(_consume_frame());
+            }
+            return emscripten::val::null();
+        }
+        if (ret < 0) {
+            if (last_good_frame) av_frame_free(&last_good_frame);
+            return emscripten::val::null();
+        }
 
         // best_effort_timestamp is more reliable than pts for MPEG-2 B-frames.
         int64_t pts_raw = frame_->best_effort_timestamp;
@@ -358,15 +398,24 @@ emscripten::val FrameServer::decode_frame_at(double target_seconds) {
 
         if (frame_pts >= threshold) {
             // This is the frame we want.
+            if (last_good_frame) av_frame_free(&last_good_frame);
             return _frame_to_result(_consume_frame());
         }
 
-        // Not there yet — discard this frame and keep reading.
+        // Not there yet — save as candidate and keep reading.
+        if (last_good_frame) av_frame_free(&last_good_frame);
+        last_good_frame = av_frame_clone(frame_);
         av_frame_unref(frame_);
     }
 
     fprintf(stderr, "FrameServer: decode_frame_at(%.3f) hit iteration limit\n",
             target_seconds);
+    // Return last good frame if we have one (handles near-EOF seek edge cases).
+    if (last_good_frame) {
+        av_frame_move_ref(frame_, last_good_frame);
+        av_frame_free(&last_good_frame);
+        return _frame_to_result(_consume_frame());
+    }
     return emscripten::val::null();
 }
 

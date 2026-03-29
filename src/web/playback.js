@@ -523,6 +523,20 @@ export class Playback {
             );
             if (!this._isPlaying || this._loopGeneration !== generation) break;
             if (!frameData) {
+              // All decode paths null — likely near clip EOF.
+              // Find the highest-PTS cached frame for this source and hold it.
+              const cacheMap = this._frameCache.get(resolved.source_path);
+              if (cacheMap && cacheMap.size > 0) {
+                let latestKey = -Infinity, latestEntry = null;
+                for (const [key, entry] of cacheMap.entries()) {
+                  if (key > latestKey) { latestKey = key; latestEntry = entry; }
+                }
+                if (latestEntry) {
+                  this._setCacheEntry(resolved.source_path, sourcePts, latestEntry);
+                  console.warn('[DecodeLoop] EOF hold-last-frame at pts', (sourcePts / 1e6).toFixed(2)); // eslint-disable-line no-console
+                  continue;
+                }
+              }
               console.warn('[DecodeLoop] All decode paths null for pts', resolved.source_pts, '— skipping'); // eslint-disable-line no-console
               continue;
             }
