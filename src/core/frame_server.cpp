@@ -380,6 +380,26 @@ emscripten::val FrameServer::decode_frame_at(double target_seconds) {
                 av_frame_free(&last_good_frame);
                 return _frame_to_result(_consume_frame());
             }
+            // Zero frames decoded after forward seek — target is past the last
+            // frame in the stream (e.g. seek to exactly clip duration). Seek
+            // backward to the last keyframe and return it so callers always get
+            // a real frame instead of null near clip EOF.
+            if (av_seek_frame(fmt_ctx_, video_stream_idx_, INT64_MAX, AVSEEK_FLAG_BACKWARD) >= 0) {
+                avcodec_flush_buffers(codec_ctx_);
+                while (av_read_frame(fmt_ctx_, packet_) >= 0) {
+                    if (packet_->stream_index != video_stream_idx_) {
+                        av_packet_unref(packet_);
+                        continue;
+                    }
+                    int r = avcodec_send_packet(codec_ctx_, packet_);
+                    av_packet_unref(packet_);
+                    if (r < 0 && r != AVERROR(EAGAIN)) break;
+                    r = avcodec_receive_frame(codec_ctx_, frame_);
+                    if (r == AVERROR(EAGAIN)) continue;
+                    if (r < 0) break;
+                    return _frame_to_result(_consume_frame());
+                }
+            }
             return emscripten::val::null();
         }
         if (ret < 0) {
