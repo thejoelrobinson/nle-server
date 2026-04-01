@@ -251,21 +251,21 @@ export class Playback {
   }
 
   /**
-   * Find the nearest cached frame to targetPts, within ±1 frame duration.
+   * Find the nearest cached frame to targetPts, within maxDist.
    * @param {string} sourcePath
    * @param {number} targetPts — µs
+   * @param {number} [maxDist] — max allowed distance in µs (default: ±1 frame duration)
    * @returns {object|null}
    */
-  _findNearestFrame(sourcePath, targetPts) {
+  _findNearestFrame(sourcePath, targetPts, maxDist = this._frameDurationUs) {
     const map = this._frameCache.get(sourcePath);
     if (!map || map.size === 0) return null;
-    const tolerance = this._frameDurationUs;
     let bestEntry = null, bestDist = Infinity;
     for (const [key, entry] of map.entries()) {
       const dist = Math.abs(key - targetPts);
       if (dist < bestDist) { bestDist = dist; bestEntry = entry; }
     }
-    return bestDist <= tolerance ? bestEntry : null;
+    return bestDist <= maxDist ? bestEntry : null;
   }
 
   /**
@@ -425,14 +425,14 @@ export class Playback {
     } else if (this._player) {
       const allCached = allResolved.every((resolved) => {
         const sourcePts = Math.round(resolved.source_pts);
-        return this._findNearestFrame(resolved.source_path, sourcePts) !== null;
+        return this._findNearestFrame(resolved.source_path, sourcePts, this._frameDurationUs * 2) !== null;
       });
 
       if (allCached) {
         this._player.clear();
         for (const resolved of allResolved) {
           const sourcePts = Math.round(resolved.source_pts);
-          const frame = this._findNearestFrame(resolved.source_path, sourcePts);
+          const frame = this._findNearestFrame(resolved.source_path, sourcePts, this._frameDurationUs * 2);
           if (frame) this._drawClipFrame(frame, resolved);
         }
         this._onFrameState?.(true);
@@ -524,18 +524,17 @@ export class Playback {
             if (!this._isPlaying || this._loopGeneration !== generation) break;
             if (!frameData) {
               // All decode paths null — likely near clip EOF.
-              // Find the highest-PTS cached frame for this source and hold it.
-              const cacheMap = this._frameCache.get(resolved.source_path);
-              if (cacheMap && cacheMap.size > 0) {
-                let latestKey = -Infinity, latestEntry = null;
-                for (const [key, entry] of cacheMap.entries()) {
-                  if (key > latestKey) { latestKey = key; latestEntry = entry; }
-                }
-                if (latestEntry) {
-                  this._setCacheEntry(resolved.source_path, sourcePts, latestEntry);
-                  console.warn('[DecodeLoop] EOF hold-last-frame at pts', (sourcePts / 1e6).toFixed(2)); // eslint-disable-line no-console
-                  continue;
-                }
+              // Find the nearest cached frame for this source (any distance) and hold it.
+              const nearestExisting = this._findNearestFrame(resolved.source_path, sourcePts, Infinity);
+              if (nearestExisting) {
+                this._setCacheEntry(resolved.source_path, sourcePts, nearestExisting);
+                console.warn('[DecodeLoop] EOF hold-last-frame at pts', (sourcePts / 1e6).toFixed(2)); // eslint-disable-line no-console
+                continue;
+              }
+              if (this._lastDisplayedBitmap) {
+                this._setCacheEntry(resolved.source_path, sourcePts, this._lastDisplayedBitmap);
+                console.warn('[DecodeLoop] hold-last-displayed-frame fallback at pts', (sourcePts / 1e6).toFixed(2)); // eslint-disable-line no-console
+                continue;
               }
               console.warn('[DecodeLoop] All decode paths null for pts', resolved.source_pts, '— skipping'); // eslint-disable-line no-console
               continue;
