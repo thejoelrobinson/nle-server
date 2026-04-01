@@ -591,11 +591,20 @@ export class FrameServerPool {
   async decodeFrameAt(sourcePath, seconds, useProxy = true) {
     const entry = this._pool.get(sourcePath);
     if (!entry) return null;
-    // A random-access seek repositions the proxy, so clear the EOF flag —
-    // subsequent sequential reads can resume from the proxy again.
-    if (useProxy && entry.proxyBridge) entry.proxyEof = false;
-    const bridge = (useProxy && entry.proxyBridge) ? entry.proxyBridge : entry.bridge;
-    return bridge.decodeFrameAt(seconds);
+
+    // Try proxy first
+    if (useProxy && entry.proxyBridge) {
+      // A random-access seek repositions the proxy, so clear the EOF flag —
+      // subsequent sequential reads can resume from the proxy again.
+      entry.proxyEof = false;
+      const proxyResult = await entry.proxyBridge.decodeFrameAt(seconds);
+      if (proxyResult !== null) return proxyResult;
+      // Proxy returned null (timestamp past proxy duration / EOF) — fall back
+      // to source so frames beyond the proxy's last PTS are never dropped.
+      console.warn(`[Pool] decodeFrameAt proxy null at ${seconds.toFixed(3)}s — falling back to source`); // eslint-disable-line no-console
+    }
+
+    return entry.bridge.decodeFrameAt(seconds);
   }
 
   /**

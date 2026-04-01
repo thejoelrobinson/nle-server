@@ -697,7 +697,11 @@ emscripten::val FrameServer::generate_proxy(int target_width, int target_height)
     if (!enc_ctx) return emscripten::val::null();
 
     AVStream* src_stream = fmt_ctx_->streams[video_stream_idx_];
-    AVRational src_fps   = src_stream->r_frame_rate;
+    // Prefer avg_frame_rate (actual encoded rate) over r_frame_rate (container
+    // hint) — for 23.976fps MXF sources r_frame_rate often reports 25, which
+    // causes the proxy timebase to be wrong and its last ~28 frames unreachable.
+    AVRational src_fps   = src_stream->avg_frame_rate;
+    if (src_fps.num <= 0 || src_fps.den <= 0) { src_fps = src_stream->r_frame_rate; }
     if (src_fps.num <= 0 || src_fps.den <= 0) { src_fps = {24, 1}; }
 
     enc_ctx->width          = target_width;
