@@ -34,6 +34,9 @@ const CODEC_IDS = {
 // out of Vite's module resolver path for that URL.
 const WASM_JS_URL = '/wasm/frame_server.js';
 
+// Increment this to invalidate all cached proxies in IndexedDB (e.g. after fps fix).
+const PROXY_CACHE_VERSION = 'avi2-';
+
 export class FrameServerBridge {
   constructor({ onFrame, onEnd, onError, onMetadata } = {}) {
     this._mod    = null;   // Emscripten module instance
@@ -462,7 +465,7 @@ export class FrameServerPool {
       && (FrameServerPool.isLongGOP(info.codec_id) || isMxf)
       && !FrameServerPool.hasWebCodecsDecode(info.codec_id);
     if (needsProxy) {
-      const hash = await FrameServerPool.hashFile(file);
+      const hash = PROXY_CACHE_VERSION + await FrameServerPool.hashFile(file);
       entry.proxyHash = hash;
 
       // 5-second timeout on IDB lookup — a hung IDB should not block proxy generation.
@@ -646,9 +649,11 @@ export class FrameServerPool {
 
     let result = bridge.decodeNextFrame();
 
-    // Proxy hit EOF — record it and do a one-time seek to reposition the source
-    // bridge; all subsequent calls will use source sequential (fast intra decode).
+    // Proxy sequential returned null — try proxy random-access before giving up.
+    // If proxy random-access also returns null, mark proxyEof and fall to source.
     if (!result && bridge !== entry.bridge && expectedSecs !== null) {
+      const proxyResult = await bridge.decodeFrameAt(expectedSecs);
+      if (proxyResult !== null) return proxyResult;
       entry.proxyEof = true;
       return entry.bridge.decodeFrameAt(expectedSecs);
     }

@@ -507,13 +507,6 @@ export class Playback {
           }
           if (!Array.isArray(allResolved)) allResolved = [];
 
-          // Near-EOF detection: when within 1.5× the prefetch window of the end,
-          // bypass the proxy and use source random-access directly. The proxy
-          // may return EOF before the source does, causing all decode paths to
-          // return null and leaving the last 2s as hold-last-frame stutter.
-          const nearingEnd = this._duration > 0 &&
-            (this._duration - this._nextDecodePts) < (this._prefetchAheadMs * 1000 * 1.5);
-
           for (const resolved of allResolved) {
             if (!this._isPlaying || this._loopGeneration !== generation) break;
 
@@ -524,22 +517,10 @@ export class Playback {
             const cacheMap = this._getCacheMap(resolved.source_path);
             if (cacheMap.has(sourcePts)) continue;
 
-            let frameData;
-            if (nearingEnd) {
-              // Use source random-access directly — bypass proxy EOF entirely.
-              try {
-                frameData = await this._pool.decodeFrameAt(
-                  resolved.source_path,
-                  usToSecs(resolved.source_pts),
-                  false  // useProxy=false — go direct to source MXF
-                );
-              } catch { frameData = null; }
-            } else {
-              // Normal sequential → proxy random-access → source fallback chain.
-              frameData = await this._decodeWithFallback(
-                resolved.source_path, resolved.source_pts, true
-              );
-            }
+            // Sequential → proxy random-access → source random-access fallback chain.
+            const frameData = await this._decodeWithFallback(
+              resolved.source_path, resolved.source_pts, true
+            );
             if (!this._isPlaying || this._loopGeneration !== generation) break;
             if (!frameData) {
               // All decode paths null — likely near clip EOF.
