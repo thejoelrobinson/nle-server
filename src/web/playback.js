@@ -37,9 +37,9 @@ function mapFFmpegColorspace(avcol_spc) {
   return COLORSPACE_DEFAULT;
 }
 
-const MAX_CACHE_FRAMES  = 90;     // ~3.75s at 24fps — matches prefetch window
-const PREFETCH_AHEAD_MS = 2000;  // 2s lookahead — fits within 90-frame cache
-const PRE_ROLL_FRAMES   = 48;     // fill the full 2000ms prefetch window (was 8)
+const MAX_CACHE_FRAMES  = 60;     // 2.5s at 24fps — prevents decode loop falling behind
+const PREFETCH_AHEAD_MS = 1000;  // 1s lookahead — 24 frames at 24fps; 60ms/frame × 24 = 1.44s decode time
+const PRE_ROLL_FRAMES   = 16;    // ~667ms at 24fps — warm enough to start, fast pre-roll
 
 export class Playback {
   /**
@@ -98,6 +98,7 @@ export class Playback {
     this._prefetchAheadMs = PREFETCH_AHEAD_MS;
     this._loopGeneration  = 0;               // incremented on each play() to invalidate stale loops
     this._consecutiveDecodeErrors = 0;       // hot-spin guard
+    this._lastDecodeProgress      = null;    // watchdog: last time _setCacheEntry succeeded
 
     this._onStateChange = onPlayStateChange;
     this._onTimecode    = onTimecodeUpdate;
@@ -248,6 +249,7 @@ export class Playback {
     const map = this._getCacheMap(sourcePath);
     map.set(roundedPts, { ...frameData, pts: roundedPts, addedAt: Date.now() });
     this._evictOldFrames(sourcePath, map);
+    this._lastDecodeProgress = performance.now();
   }
 
   /**
@@ -360,6 +362,17 @@ export class Playback {
 
   _tick(now) {
     if (!this._isPlaying) return;
+
+    // Watchdog: if decode loop hasn't written a frame in 2s while playing, restart it.
+    if (this._loopGeneration > 0) {
+      if (!this._lastDecodeProgress || (now - this._lastDecodeProgress) > 2000) {
+        console.warn('[Tick] Decode loop appears stalled — restarting (last progress:', // eslint-disable-line no-console
+          this._lastDecodeProgress ? ((now - this._lastDecodeProgress) / 1000).toFixed(1) + 's ago' : 'never', ')');
+        this._lastDecodeProgress = now;  // reset so we don't spam restarts
+        this._loopGeneration++;
+        this._decodeLoop(this._loopGeneration);
+      }
+    }
 
     // Elapsed since last tick, clamped to 2× frame duration so a backgrounded
     // tab can't jump the playhead by seconds when it resumes.

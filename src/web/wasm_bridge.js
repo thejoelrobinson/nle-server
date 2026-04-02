@@ -455,7 +455,7 @@ export class FrameServerPool {
     await bridge.openFile(file, importProgressCb);
 
     const info = bridge.getStreamInfo();
-    const entry = { bridge, proxyBridge: null, file, info, proxyHash: null };
+    const entry = { bridge, proxyBridge: null, file, info, proxyHash: null, _proxyNullCount: 0, proxyStale: false };
     this._pool.set(file.name, entry);
 
     // Skip proxy when WebCodecs hardware decode is available (H.264, HEVC, VP9, AV1).
@@ -557,6 +557,40 @@ export class FrameServerPool {
   }
 
   /**
+   * Track consecutive proxy nulls for a source and trigger regeneration if
+   * the proxy appears stale (e.g. version-bumped cache key left an old proxy).
+   * Called from decodeFrameAt / decodeNextFrame whenever the proxy returns null.
+   * @param {string} sourcePath
+   */
+  _ensureProxyFresh(sourcePath) {
+    const entry = this._pool.get(sourcePath);
+    if (!entry || !entry.proxyBridge || entry.proxyStale || !entry.proxyHash) return;
+    entry._proxyNullCount = (entry._proxyNullCount || 0) + 1;
+    if (entry._proxyNullCount >= 3) {
+      console.warn('[Pool] Proxy returning', entry._proxyNullCount, 'consecutive nulls — marking stale and regenerating:', sourcePath); // eslint-disable-line no-console
+      entry.proxyStale = true;
+      entry.proxyBridge.destroy();
+      entry.proxyBridge = null;
+      entry._proxyNullCount = 0;
+      this._generateProxyBackground(sourcePath);
+    }
+  }
+
+  /**
+   * Public method to regenerate the proxy for a source path.
+   * Destroys any existing proxy bridge and regenerates from the source.
+   * @param {string} sourcePath
+   */
+  async generateProxy(sourcePath) {
+    const entry = this._pool.get(sourcePath);
+    if (!entry) return;
+    if (entry.proxyBridge) { entry.proxyBridge.destroy(); entry.proxyBridge = null; }
+    entry.proxyStale = false;
+    entry._proxyNullCount = 0;
+    await this._generateProxyBackground(sourcePath);
+  }
+
+  /**
    * Setter for the proxy-progress callback.
    * Called with (path, currentFrame, totalFrames).
    */
@@ -601,10 +635,14 @@ export class FrameServerPool {
       // subsequent sequential reads can resume from the proxy again.
       entry.proxyEof = false;
       const proxyResult = await entry.proxyBridge.decodeFrameAt(seconds);
-      if (proxyResult !== null) return proxyResult;
+      if (proxyResult !== null) {
+        entry._proxyNullCount = 0;  // reset stale detector on success
+        return proxyResult;
+      }
       // Proxy returned null (timestamp past proxy duration / EOF) — fall back
       // to source so frames beyond the proxy's last PTS are never dropped.
       console.warn(`[Pool] decodeFrameAt proxy null at ${seconds.toFixed(3)}s — falling back to source`); // eslint-disable-line no-console
+      this._ensureProxyFresh(sourcePath);
     }
 
     return entry.bridge.decodeFrameAt(seconds);
@@ -653,12 +691,19 @@ export class FrameServerPool {
     // If proxy random-access also returns null, mark proxyEof and fall to source.
     if (!result && bridge !== entry.bridge && expectedSecs !== null) {
       const proxyResult = await bridge.decodeFrameAt(expectedSecs);
-      if (proxyResult !== null) return proxyResult;
+      if (proxyResult !== null) {
+        entry._proxyNullCount = 0;  // reset stale detector on success
+        return proxyResult;
+      }
+      this._ensureProxyFresh(sourcePath);
       entry.proxyEof = true;
       return entry.bridge.decodeFrameAt(expectedSecs);
     }
 
     if (!result) return null;
+
+    // Reset stale counter whenever proxy sequential decode succeeds.
+    if (bridge !== entry.bridge) entry._proxyNullCount = 0;
 
     // Validate pts if caller provided an expected position.
     if (expectedSecs !== null && typeof result.pts === 'number') {
