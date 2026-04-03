@@ -490,6 +490,8 @@ export class FrameServerPool {
             new File([proxyBlob], 'proxy.mjpeg', { type: 'video/x-mjpeg' })
           );
           entry.proxyBridge = proxyBridge;
+          entry.proxyEof = false;
+          entry.proxyRegenTriggered = false;
         } catch (err) {
           console.warn('[FrameServerPool] Failed to open cached proxy:', err); // eslint-disable-line no-console
         }
@@ -548,6 +550,8 @@ export class FrameServerPool {
         new File([proxyBlob], 'proxy.mjpeg', { type: 'video/x-mjpeg' })
       );
       entry.proxyBridge = proxyBridge;
+      entry.proxyEof = false;
+      entry.proxyRegenTriggered = false;
     } catch (err) {
       console.warn('[FrameServerPool] Failed to open generated proxy:', err); // eslint-disable-line no-console
       return;
@@ -676,6 +680,14 @@ export class FrameServerPool {
     // which is far too slow for realtime H.264/HEVC playback.
     if (entry.proxyEof) useProxy = false;
 
+    // Fix 2: When proxy is exhausted, use sequential source decode — much faster
+    // than random-access on 4K/MXF source. Fall back to random-access only as last resort.
+    if (entry.proxyEof) {
+      const seqResult = entry.bridge.decodeNextFrame();
+      if (seqResult) return seqResult;
+      return expectedSecs !== null ? entry.bridge.decodeFrameAt(expectedSecs) : null;
+    }
+
     const bridge = (useProxy && entry.proxyBridge) ? entry.proxyBridge : entry.bridge;
 
     // For WebCodecs-capable bridges (H.264, HEVC, VP9, AV1), hardware random-access
@@ -696,6 +708,15 @@ export class FrameServerPool {
         return proxyResult;
       }
       this._ensureProxyFresh(sourcePath);
+      if (!entry.proxyRegenTriggered) {
+        entry.proxyRegenTriggered = true;
+        console.warn('[Pool] Proxy EOF detected — regenerating proxy in background'); // eslint-disable-line no-console
+        this.generateProxy(sourcePath).then(() => {
+          entry.proxyEof = false;
+          entry.proxyRegenTriggered = false;
+          console.log('[Pool] Proxy regenerated — resuming proxy decode'); // eslint-disable-line no-console
+        }).catch((e) => console.error('[Pool] Proxy regen failed:', e)); // eslint-disable-line no-console
+      }
       entry.proxyEof = true;
       return entry.bridge.decodeFrameAt(expectedSecs);
     }
@@ -714,6 +735,15 @@ export class FrameServerPool {
         // Use source bridge if this is a proxy bridge and pts is past proxy duration,
         // to avoid returning a clamped/wrong proxy frame as a valid result.
         if (bridge !== entry.bridge && expectedSecs > bridge.duration) {
+          if (!entry.proxyRegenTriggered) {
+            entry.proxyRegenTriggered = true;
+            console.warn('[Pool] Proxy EOF detected — regenerating proxy in background'); // eslint-disable-line no-console
+            this.generateProxy(sourcePath).then(() => {
+              entry.proxyEof = false;
+              entry.proxyRegenTriggered = false;
+              console.log('[Pool] Proxy regenerated — resuming proxy decode'); // eslint-disable-line no-console
+            }).catch((e) => console.error('[Pool] Proxy regen failed:', e)); // eslint-disable-line no-console
+          }
           entry.proxyEof = true;
           return entry.bridge.decodeFrameAt(expectedSecs);
         }

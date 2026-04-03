@@ -38,8 +38,8 @@ function mapFFmpegColorspace(avcol_spc) {
 }
 
 const MAX_CACHE_FRAMES  = 60;     // 2.5s at 24fps — prevents decode loop falling behind
-const PREFETCH_AHEAD_MS = 1000;  // 1s lookahead — 24 frames at 24fps; 60ms/frame × 24 = 1.44s decode time
-const PRE_ROLL_FRAMES   = 16;    // ~667ms at 24fps — warm enough to start, fast pre-roll
+const PREFETCH_AHEAD_MS = 800;   // 800ms lookahead — 24 frames at 30fps; even with 1-2 source fallbacks stays <600ms total
+const PRE_ROLL_FRAMES   = 12;    // ~500ms at 24fps — enough to start smooth, fast enough to not block
 
 export class Playback {
   /**
