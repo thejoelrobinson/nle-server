@@ -35,7 +35,7 @@ const CODEC_IDS = {
 const WASM_JS_URL = '/wasm/frame_server.js';
 
 // Increment this to invalidate all cached proxies in IndexedDB (e.g. after fps fix).
-const PROXY_CACHE_VERSION = 'avi2-';
+const PROXY_CACHE_VERSION = 'avi3-';
 
 export class FrameServerBridge {
   constructor({ onFrame, onEnd, onError, onMetadata } = {}) {
@@ -490,6 +490,8 @@ export class FrameServerPool {
             new File([proxyBlob], 'proxy.mjpeg', { type: 'video/x-mjpeg' })
           );
           entry.proxyBridge = proxyBridge;
+          entry.proxyEof = false;
+          entry._proxyNullCount = 0;
         } catch (err) {
           console.warn('[FrameServerPool] Failed to open cached proxy:', err); // eslint-disable-line no-console
         }
@@ -548,6 +550,8 @@ export class FrameServerPool {
         new File([proxyBlob], 'proxy.mjpeg', { type: 'video/x-mjpeg' })
       );
       entry.proxyBridge = proxyBridge;
+      entry.proxyEof = false;
+      entry._proxyNullCount = 0;
     } catch (err) {
       console.warn('[FrameServerPool] Failed to open generated proxy:', err); // eslint-disable-line no-console
       return;
@@ -697,7 +701,7 @@ export class FrameServerPool {
       }
       this._ensureProxyFresh(sourcePath);
       entry.proxyEof = true;
-      return entry.bridge.decodeFrameAt(expectedSecs);
+      return entry.bridge.decodeNextFrame();
     }
 
     if (!result) return null;
@@ -715,7 +719,7 @@ export class FrameServerPool {
         // to avoid returning a clamped/wrong proxy frame as a valid result.
         if (bridge !== entry.bridge && expectedSecs > bridge.duration) {
           entry.proxyEof = true;
-          return entry.bridge.decodeFrameAt(expectedSecs);
+          return entry.bridge.decodeNextFrame();
         }
         return bridge.decodeFrameAt(expectedSecs);
       }
